@@ -7,11 +7,11 @@
 // Concept conformance
 // ---------------------------------------------------------------------------
 
-static_assert(cgx::reactor::Clock<cgx::reactor::steady_clock>,
-              "steady_clock must satisfy the Clock concept");
+static_assert(cgx::reactor::clock<cgx::reactor::steady_clock>,
+              "steady_clock must satisfy the clock concept");
 
-static_assert(cgx::reactor::Clock<cgx::reactor::test::mock_clock>,
-              "mock_clock must satisfy the Clock concept");
+static_assert(cgx::reactor::clock<cgx::reactor::test::mock_clock>,
+              "mock_clock must satisfy the clock concept");
 
 // ---------------------------------------------------------------------------
 // mock_clock unit tests

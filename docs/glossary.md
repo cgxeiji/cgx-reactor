@@ -28,16 +28,25 @@ _Avoid_: Timer, time source
 Task slot is available. Task can be triggered. No coroutine frame is active.
 
 **Running**:
-Task has been triggered and is executing. Cannot be triggered again until it returns or suspends.
+Task has been triggered and is executing. Cannot be triggered again until it suspends or completes.
 
 **Suspended**:
-Task is waiting (e.g., `co_await delay_ms(100)`). Coroutine handle is registered with timer queue. Will resume when condition is met.
+Task is waiting on something (timer expiry, signal fire, etc.). Not running, not idle. The suspension mechanism is internal — from the domain perspective, the task is simply not runnable.
 
 ### Configuration
 
 **Config**:
-Compile-time configuration struct passed as template parameter to engine. Specifies pool size, max tasks, max timers, etc.
+Compile-time policy struct passed as template parameter to engine. Specifies max_timers, max_signal_listeners, and optionally task_frame_size (defaults to 1024 bytes).
 _Avoid_: Settings, options, parameters
+
+### Engine Operations
+
+**Trigger**:
+Transitions a task from Idle → Running. Calls the task coroutine function with provided arguments. The coroutine runs until it suspends or returns. Returns `error::task_already_running` if the task is already active.
+_Avoid_: Start, launch, invoke
+
+**Tick**:
+Engine method that processes expired timers and resumes their associated coroutines. Called repeatedly from the event loop. Collects all expired timers first (maintaining FIFO order), then resumes them — ensuring signal broadcasts reach all listeners that resumed in the same tick.
 
 ### Error Handling
 
@@ -47,17 +56,21 @@ _Avoid_: Exception, status code, result
 
 ## Relationships
 
-- An **Engine** manages zero or more **Tasks** (compile-time registered)
-- A **Task** can be in one of three states: **Idle**, **Running**, or **Suspended**
+- An **Engine** is parameterized with zero or more **Tasks** (compile-time NTTP registration)
+- A **Task** transitions through: **Idle** → (trigger) → **Running** → (suspend) → **Suspended** → (resume) → **Running** or **Idle**
+- A **Tick** resumes expired timer-suspended tasks; signal-suspended tasks resume directly via fire()
 - A **Task** can `listen()` to a **Signal** (suspends until signal fires)
-- A **Task** can `fire()` a **Signal** (broadcasts to all listeners)
-- An **Engine** uses a **Clock** to manage timer queue
+- A **Task** can `fire()` a **Signal** (broadcasts to all suspended listeners)
+- An **Engine** uses a **Clock** to determine timer expiry
 - A **Signal** is standalone — not managed by the engine
 
 ## Example dialogue
 
 > **Dev:** "When I trigger a task that's already running, what happens?"
 > **Domain expert:** "You get an `error::task_already_running`. No queuing, no undefined behavior."
+
+> **Dev:** "How does the event loop work?"
+> **Domain expert:** "You call `tick()` in a loop. Tick processes expired timers and resumes those tasks. If tasks suspend on signals, they resume directly when `fire()` is called — not via tick. The event loop just keeps ticking."
 
 > **Dev:** "Can I have multiple instances of the same task type?"
 > **Domain expert:** "No — each registered task type is a singleton with a fixed slot. If you need multiple instances, register multiple task types."

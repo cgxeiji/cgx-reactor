@@ -109,7 +109,7 @@ class engine {
     static void mark_suspended(void* ctx, std::coroutine_handle<> h) noexcept {
         auto* self = static_cast<engine*>(ctx);
         for (auto& s : self->slots_) {
-            if (s.current_task.handle() == h) {
+            if (s.current_task.handle() && s.current_task.handle().address() == h.address()) {
                 s.suspended = true;
                 break;
             }
@@ -168,13 +168,17 @@ public:
 
         // Point the thread-local allocator at the slot buffer and invoke the
         // coroutine. The promise_type::operator new will return this buffer.
-        // Also install the timer registrar so that any delay_ms in the initial
-        // execution of the coroutine can register with this engine.
+        // With initial_suspend = suspend_always, the coroutine suspends immediately,
+        // allowing us to store the handle before any user code runs.
         detail::current_task_allocator = {s.storage, sizeof(s.storage)};
         detail::current_timer_registrar = {&timer_registrar_add, this};
         detail::current_external_suspension_registrar = {&mark_suspended, this};
         s.suspended = false;  // Task is running
         s.current_task = task{Fn(std::forward<Args>(args)...)};
+        
+        // Now the handle is stored in the slot. Resume to start execution.
+        s.current_task.handle().resume();
+        
         detail::current_external_suspension_registrar = {};
         detail::current_timer_registrar = {};
 
@@ -193,7 +197,35 @@ public:
         detail::current_timer_registrar = {&timer_registrar_add, this};
         detail::current_external_suspension_registrar = {&mark_suspended, this};
 
-        // Collect all expired timers first (maintains FIFO order)
+        // Clean up completed tasks (e.g., tasks that completed via signal resume)
+        for_each_slot([this](slot_t& s) {
+            if (s.occupied && s.current_task.handle() && s.current_task.handle().done()) {
+                s.occupied = false;
+            }
+        });
+
+        // (a) Resume directly-runnable tasks — occupied, not done,
+        //     not suspended on external event, and NOT waiting on a pending timer.
+        for_each_slot([this](slot_t& s) {
+            if (s.occupied && s.current_task.handle() &&
+                !s.current_task.handle().done() && !s.suspended) {
+                bool has_timer = false;
+                for (std::size_t j = 0; j < timer_count_; ++j) {
+                    if (timers_[j].handle == s.current_task.handle()) {
+                        has_timer = true;
+                        break;
+                    }
+                }
+                if (!has_timer) {
+                    s.current_task.handle().resume();
+                    if (s.current_task.handle().done()) {
+                        s.occupied = false;
+                    }
+                }
+            }
+        });
+
+        // (b) Collect all expired timers first (maintains FIFO order)
         std::array<std::coroutine_handle<>, Config::max_timers> expired;
         std::size_t expired_count = 0;
         
@@ -212,7 +244,7 @@ public:
             }
         }
         
-        // Resume all expired timers
+        // (c) Resume all expired timers
         for (std::size_t i = 0; i < expired_count; ++i) {
             auto h = expired[i];
             for_each_slot([&](slot_t& s) {

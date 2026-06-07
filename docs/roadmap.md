@@ -3,7 +3,7 @@
 ## 2026-06-07 — Barebones POC
 
 - **Channels (queue-based)** — broadcast signals chosen for barebones; queue-based channels (single listener consumes value) deferred until use case demands it
-- **Generic awaiter concept** — reactor manages timers directly for now; a `concept awaiter { is_ready(); resume(); }` would allow reactor-managed non-timer awaitables; deferred to keep barebones simple
+- **~~Generic awaiter concept~~** — implemented via thread-local registrar pattern (`current_timer_registrar`, `current_external_suspension_registrar`); awaitables find their engine context without explicit parameters. A formal C++20 `concept` could refine this later but isn't blocking.
 - **`delay_until(time_point)`** — absolute-time awaitable for drift-free periodic tasks; `delay_ms` sufficient for barebones
 - **`yield` awaitable** — cooperative CPU sharing; not needed for barebones task counts
 - **Task lifecycle (`cancel()`, `join()`)** — `final_suspend = suspend_always` leaves the door open; no API surface added yet

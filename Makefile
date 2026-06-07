@@ -1,4 +1,4 @@
-.PHONY: test example_basic
+.PHONY: test example_basic example_error_handling
 
 test:
 	cmake --build build --target cgx-reactor-tests
@@ -6,3 +6,6 @@ test:
 
 example_basic:
 	cmake --build build --target cgx-reactor-basic
+
+example_error_handling:
+	cmake --build build --target cgx-reactor-error-handling

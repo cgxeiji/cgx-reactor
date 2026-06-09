@@ -7,7 +7,7 @@ This document describes the architecture of cgx-reactor, a header-only C++20 cor
 1. **Zero heap allocation** — all memory is statically allocated at compile time
 2. **No exceptions** — error handling via return codes
 3. **Header-only** — single-include for easy integration
-4. **Compile-time task registration** — tasks are registered via NTTPs (non-type template parameters), eliminating runtime overhead
+4. **Compile-time task registration** — tasks are registered via NTTPs (non-type template parameters) or via `register_instance`/`register_task` helpers, eliminating runtime overhead
 5. **Cooperative scheduling** — tasks voluntarily yield via suspension points
 
 ## Core Components
@@ -23,26 +23,64 @@ The `engine` class is the central scheduler. It:
 ```cpp
 template <typename Config,          // Configuration policy
           typename Clock,           // clock concept (std::chrono-compatible)
-          auto... TaskFunctions>    // Task function pointers (NTTPs)
+          typename... Entries>      // Typed slot entries (descriptors)
 class engine;
 ```
 
-**Example:**
+**Construction (via `make_engine`):**
 ```cpp
-engine<Config, std::chrono::steady_clock, &sensor_task, &display_task> reactor;
+auto eng = make_engine<Config, Clock>(
+    register_task<"TAG"_tag, &free_task>(),
+    register_task<"TAG"_tag, &another_task>()
+);
+```
+
+**With member-function tasks:**
+```cpp
+auto eng = make_engine<Config, Clock>(
+    register_instance<"DISP"_tag>(display)
+);
 ```
 
 ### Task
 
-A task is a coroutine function registered with the engine. Each task has a dedicated slot containing:
+A task is a coroutine registered with the engine. Each task has a dedicated slot containing:
 - Storage for the coroutine frame (placement-new allocated)
 - State: `idle`, `running`, or `suspended`
 - Handle to the coroutine
+- Self pointer (for member-function tasks) or nullptr (for free-function tasks)
 
 **Task lifecycle:**
 1. **Idle** — slot is empty, task can be triggered
 2. **Running** — coroutine is executing
 3. **Suspended** — coroutine is waiting (on timer or signal)
+
+### Tag
+
+A compile-time 4-character identifier for debugging and error messages:
+
+```cpp
+template <char... Cs>
+struct tag { ... };
+```
+
+Tags are normally constructed via the `"DISP"_tag` user-defined literal (C++20 template UDL, P1040R6). The escape hatch `make_tag<'D','I','S','P'>()` is available when the tag chars are not known as a string literal at the call site (e.g. metaprogramming). The UDL requires a `using` declaration in scope:
+
+```cpp
+using cgx::reactor::operator""_tag;   // bring the UDL into scope
+```
+
+### Task List
+
+Classes with member-function tasks expose a `reactor_tasks` alias:
+
+```cpp
+class MyDriver {
+    task run_loop();
+    task fire_once(int);
+    using reactor_tasks = task_list<&MyDriver::run_loop, &MyDriver::fire_once>;
+};
+```
 
 ### Signal
 
@@ -149,6 +187,32 @@ signal::fire() directly resumes coroutine → task state: running
 Task continues execution
 ```
 
+## Registration Flow
+
+### Free-function tasks
+
+```
+User code:  register_task<"TAG"_tag, &free_fn>()
+    ↓
+make_engine unfolds the free_spec into a task_descriptor
+    ↓
+engine stores fn as NTTP for compile-time dispatch
+```
+
+### Member-function tasks
+
+```
+Driver class:  using reactor_tasks = task_list<&Driver::method1, &Driver::method2>;
+    ↓
+User code:  register_instance<"TAG"_tag>(obj)
+    ↓
+register_instance reads Class::reactor_tasks and returns bound<Class, Tag, MemFns...>
+    ↓
+make_engine unfolds the bound into one task_descriptor per member function
+    ↓
+engine stores each fn as NTTP, plus the self pointer in the slot
+```
+
 ## Memory Model
 
 All memory is statically allocated:
@@ -227,3 +291,13 @@ See [roadmap.md](roadmap.md) for planned features:
 - Queue-based channels (point-to-point communication)
 - Task lifecycle management (`cancel()`, `join()`)
 - RP2040 clock implementation
+
+## Examples
+
+Three runnable examples live under `examples/`:
+
+| Directory | What it shows |
+|-----------|---------------|
+| `examples/basic/` | Free-function tasks wired through `register_task` + `make_engine`. Producer/consumer over a signal. The simplest end-to-end demo. |
+| `examples/error_handling/` | Exercises every error code (`task_already_running`, `queue_full`, `listener_limit_exceeded`) with a deliberately small `Config` so the limits are easy to hit. |
+| `examples/member_task/` | The hero example for the member-function API. Three classes — two mock sensors and a serial printer consumer — all using `reactor_tasks` aliases and `register_instance`. Run with `make example_member_task`; produces interleaved temperature/pressure readings over ~3 seconds. |

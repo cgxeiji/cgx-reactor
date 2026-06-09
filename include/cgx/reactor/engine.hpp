@@ -4,6 +4,7 @@
 #include <cgx/reactor/config.hpp>
 #include <cgx/reactor/error.hpp>
 #include <cgx/reactor/timer.hpp>
+#include <cgx/reactor/task_list.hpp>
 
 #include <array>
 #include <chrono>
@@ -15,33 +16,11 @@
 
 namespace cgx::reactor {
 
+// Forward declaration (needed by engine_from_desc_list)
+template <typename Config, typename Clock, typename... Entries>
+class engine;
+
 namespace detail {
-
-// -------------------------------------------------------------------------
-// Compile-time index lookup: find position of Target in a pack of NTTPs.
-// Works with heterogeneous function pointer types.
-// -------------------------------------------------------------------------
-
-template <auto Target, auto First, auto... Rest>
-consteval std::size_t index_of() {
-    // Only compare if types match; otherwise skip
-    if constexpr (std::is_same_v<decltype(First), decltype(Target)>) {
-        if constexpr (First == Target) {
-            return 0;
-        } else if constexpr (sizeof...(Rest) == 0) {
-            return static_cast<std::size_t>(-1);  // not found
-        } else {
-            return 1 + index_of<Target, Rest...>();
-        }
-    } else {
-        // Types don't match, skip this one
-        if constexpr (sizeof...(Rest) == 0) {
-            return static_cast<std::size_t>(-1);  // not found
-        } else {
-            return 1 + index_of<Target, Rest...>();
-        }
-    }
-}
 
 // -------------------------------------------------------------------------
 // Slot: owns coroutine-frame storage and tracks occupancy.
@@ -53,6 +32,16 @@ struct slot {
     task current_task;
     bool occupied = false;
     bool suspended = true;  // true if task is suspended (waiting for timer/signal/etc)
+    void* self = nullptr;   // instance pointer for member-function tasks (null for free fns)
+};
+
+// Build engine type from a type_list of descriptors
+template <typename Config, typename Clock, typename List>
+struct engine_from_desc_list;
+
+template <typename Config, typename Clock, typename... Ds>
+struct engine_from_desc_list<Config, Clock, detail::type_list<Ds...>> {
+    using type = engine<Config, Clock, Ds...>;
 };
 
 }  // namespace detail
@@ -61,15 +50,13 @@ struct slot {
 ///
 /// \tparam Config     Policy type (e.g. default_config).
 /// \tparam ClockType  Clock satisfying the Clock concept.
-/// \tparam TaskPtrs   Function pointers to registered task coroutines
-///                    (e.g. `&hello_task`, `&producer_task`).
+/// \tparam Entries    Typed slot entries (task_descriptor<Fn, Tag, Class>)
+///                    produced by make_engine or directly via unfold_specs.
 ///
 /// Each task is uniquely identified by its function pointer (NTTP).
-/// No signature collisions are possible — two tasks with the same
-/// signature are still distinct slots.
-template <typename Config, typename ClockType, auto... TaskPtrs>
+template <typename Config, typename ClockType, typename... Entries>
 class engine {
-    static constexpr std::size_t num_tasks = sizeof...(TaskPtrs);
+    static constexpr std::size_t num_tasks = sizeof...(Entries);
 
     // Per-task slot storage size.
     // Override by defining Config::task_frame_size, otherwise 1024.
@@ -86,10 +73,11 @@ class engine {
 
     template <auto Fn>
     static constexpr std::size_t slot_index() {
-        constexpr auto idx = detail::index_of<Fn, TaskPtrs...>();
+        constexpr auto idx = detail::index_of_fn<Fn, Entries::fn...>();
         static_assert(idx < num_tasks,
                       "Task not registered with this engine. "
-                      "Pass the function pointer as a template argument to engine<...>.");
+                      "Make sure the function pointer is included in a spec "
+                      "passed to make_engine(...).");
         return idx;
     }
 
@@ -120,7 +108,16 @@ class engine {
     std::size_t timer_count_ = 0;
 
 public:
-    engine() = default;
+    engine() = delete;
+
+    /// Construct an engine with self pointers for member-function tasks.
+    /// Called by make_engine().  For engines with zero tasks the array
+    /// is empty and all self pointers are null-initialised.
+    engine(std::array<void*, num_tasks> self_ptrs) : slots_{} {
+        for (std::size_t i = 0; i < num_tasks; ++i) {
+            slots_[i].self = self_ptrs[i];
+        }
+    }
 
     engine(const engine&) = delete;
     engine& operator=(const engine&) = delete;
@@ -145,12 +142,15 @@ public:
 
     /// Trigger a registered task coroutine.
     ///
-    /// \tparam Fn  The function pointer of the task (must be one of TaskPtrs).
+    /// \tparam Fn  The function pointer of the task.
     /// \param args Arguments forwarded to the coroutine function.
+    ///             For member-function tasks, the instance pointer was
+    ///             captured at registration — do NOT pass it here.
     /// \return error::ok on success, error::task_already_running if active.
     ///
     /// Usage:
     ///   eng.trigger<&my_task>(arg1, arg2);
+    ///   eng.trigger<&MyClass::method>(arg1, arg2);  // no instance arg
     template <auto Fn, typename... Args>
     error trigger(Args&&... args) {
         constexpr auto idx = slot_index<Fn>();
@@ -174,11 +174,20 @@ public:
         detail::current_timer_registrar = {&timer_registrar_add, this};
         detail::current_external_suspension_registrar = {&mark_suspended, this};
         s.suspended = false;  // Task is running
-        s.current_task = task{Fn(std::forward<Args>(args)...)};
-        
+
+        // Dispatch: member function vs free function
+        using desc = typename detail::type_at<idx, Entries...>::type;
+        if constexpr (std::is_member_function_pointer_v<decltype(Fn)>) {
+            using Class = typename desc::class_type;
+            auto* obj = static_cast<Class*>(s.self);
+            s.current_task = task{(obj->*Fn)(std::forward<Args>(args)...)};
+        } else {
+            s.current_task = task{Fn(std::forward<Args>(args)...)};
+        }
+
         // Now the handle is stored in the slot. Resume to start execution.
         s.current_task.handle().resume();
-        
+
         detail::current_external_suspension_registrar = {};
         detail::current_timer_registrar = {};
 
@@ -228,7 +237,7 @@ public:
         // (b) Collect all expired timers first (maintains FIFO order)
         std::array<std::coroutine_handle<>, Config::max_timers> expired;
         std::size_t expired_count = 0;
-        
+
         auto now = ClockType::now();
         for (std::size_t i = 0; i < timer_count_;) {
             if (timers_[i].wake_time <= now) {
@@ -243,7 +252,7 @@ public:
                 ++i;
             }
         }
-        
+
         // (c) Resume all expired timers
         for (std::size_t i = 0; i < expired_count; ++i) {
             auto h = expired[i];
@@ -274,5 +283,46 @@ public:
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// make_engine — build an engine from runtime specs
+// ---------------------------------------------------------------------------
+
+/// Build an engine from a list of bound/free specs.
+///
+/// Usage:
+///   auto eng = make_engine<Config, Clock>(
+///       register_instance<"TAG"_tag>(my_obj),
+///       register_task<"TAG"_tag, &my_fn>()
+///   );
+///
+/// Each bound is unfolded into one slot per member function (all sharing
+/// the same self pointer).  Each free_spec produces one slot.
+template <typename Config, typename Clock, typename... Specs>
+auto make_engine(Specs&&... specs) {
+    using desc_list = typename detail::spec_unfolder<std::decay_t<Specs>...>::type;
+    using eng_t = typename detail::engine_from_desc_list<Config, Clock, desc_list>::type;
+    constexpr std::size_t N = detail::count_slots<std::decay_t<Specs>...>::value;
+
+    std::array<void*, N> self_ptrs{};
+    std::size_t idx = 0;
+    (
+        [&](auto& spec) {
+            using SpecT = std::decay_t<decltype(spec)>;
+            if constexpr (requires { spec.self; }) {
+                // bound — multiple slots, all share the same self pointer
+                for (std::size_t i = 0; i < SpecT::num_fns; ++i) {
+                    self_ptrs[idx++] = static_cast<void*>(spec.self);
+                }
+            } else {
+                // free_spec — one slot, no self pointer
+                self_ptrs[idx++] = nullptr;
+            }
+        }(specs),
+        ...
+    );
+
+    return eng_t{self_ptrs};
+}
 
 }  // namespace cgx::reactor

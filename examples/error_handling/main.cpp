@@ -109,44 +109,48 @@ task listener_task_3() {
 
 int main() {
     std::cout << "=== Error Handling Example ===\n\n";
-    
-    engine<small_config, steady_clock,
-           &long_running_task,
-           &timer_task_a, &timer_task_b, &timer_task_c,
-           &listener_task_1, &listener_task_2, &listener_task_3> eng;
-    
+
+    auto eng = make_engine<small_config, steady_clock>(
+        register_task<"LONG"_tag, &long_running_task>(),
+        register_task<"TMA_"_tag, &timer_task_a>(),
+        register_task<"TMB_"_tag, &timer_task_b>(),
+        register_task<"TMC_"_tag, &timer_task_c>(),
+        register_task<"LST1"_tag, &listener_task_1>(),
+        register_task<"LST2"_tag, &listener_task_2>(),
+        register_task<"LST3"_tag, &listener_task_3>());
+
     // Error 1: task_already_running
     std::cout << "--- Error 1: task_already_running ---\n";
-    auto ec = eng.trigger<&long_running_task>();
+    auto ec = eng.template trigger<&long_running_task>();
     std::cout << "First trigger: " << to_string(ec) << "\n";
-    
-    ec = eng.trigger<&long_running_task>();
+
+    ec = eng.template trigger<&long_running_task>();
     std::cout << "Second trigger (should fail): " << to_string(ec) << "\n";
-    
+
     std::cout << "\n";
-    
+
     // Error 2: queue_full
     std::cout << "--- Error 2: queue_full ---\n";
     std::cout << "Triggering 3 tasks that each add a timer (max_timers=2)...\n";
-    eng.trigger<&timer_task_a>();
-    eng.trigger<&timer_task_b>();
-    eng.trigger<&timer_task_c>();
+    eng.template trigger<&timer_task_a>();
+    eng.template trigger<&timer_task_b>();
+    eng.template trigger<&timer_task_c>();
     eng.tick();  // All three run, but only 2 timers succeed
-    
+
     std::cout << "\n";
-    
+
     // Error 3: listener_limit_exceeded
     std::cout << "--- Error 3: listener_limit_exceeded ---\n";
     std::cout << "Triggering 3 tasks that each listen on signal (max_listeners=2)...\n";
-    eng.trigger<&listener_task_1>();
-    eng.trigger<&listener_task_2>();
-    eng.trigger<&listener_task_3>();
+    eng.template trigger<&listener_task_1>();
+    eng.template trigger<&listener_task_2>();
+    eng.template trigger<&listener_task_3>();
     eng.tick();  // First two suspend, third fails immediately
-    
+
     std::cout << "\nFiring signal to resume listeners...\n";
     limited_signal.fire(42);
     eng.tick();
-    
+
     std::cout << "\n=== Example Complete ===\n";
     return 0;
 }

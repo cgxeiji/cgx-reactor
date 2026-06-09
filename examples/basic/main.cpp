@@ -4,6 +4,7 @@
 #include <cstdlib>
 
 using namespace std::chrono_literals;
+using cgx::reactor::operator""_tag;
 
 // -----------------------------------------------------------------------
 // Signal for inter-task data transfer
@@ -39,16 +40,9 @@ cgx::reactor::task producer_task(std::uint8_t& value) {
 // -----------------------------------------------------------------------
 // Consumer task — reactive, waits on signal and prints received values
 //
-// IMPORTANT: A delay_ms(200ms) is placed BEFORE each listen() call so
-// that the consumer always has a pending timer entry.  This prevents
-// the engine's tick() step (a) from treating a signal-waiting task as
-// "runnable" (tasks without a pending timer are resumed by step (a)).
-// The delay is kept in sync with the producer's period so both timers
-// expire in the same tick() call and the consumer is already listening
-// when the producer fires.
-//
-// The unused char parameter differentiates this task's slot from
-// hello_task (which is also `task()`).
+// The consumer listens immediately and suspends on the signal.  When the
+// producer fires the signal the consumer is resumed directly (not via
+// tick()).  The delay_ms in the producer ensures timed events stay in sync.
 // -----------------------------------------------------------------------
 
 cgx::reactor::task consumer_task() {
@@ -74,15 +68,13 @@ cgx::reactor::task consumer2_task() {
 // -----------------------------------------------------------------------
 
 int main() {
-    using engine_t = cgx::reactor::engine<
+    auto eng = cgx::reactor::make_engine<
         cgx::reactor::default_config,
-        cgx::reactor::steady_clock,
-        &hello_task,
-        &producer_task,
-        &consumer_task,
-        &consumer2_task>;
-
-    engine_t eng;
+        cgx::reactor::steady_clock>(
+        cgx::reactor::register_task<"HELO"_tag, &hello_task>(),
+        cgx::reactor::register_task<"PROD"_tag, &producer_task>(),
+        cgx::reactor::register_task<"CNS1"_tag, &consumer_task>(),
+        cgx::reactor::register_task<"CNS2"_tag, &consumer2_task>());
 
     // Trigger order matters: consumer FIRST so its timer sits at a lower
     // array index and is processed before the producer's timer in tick().
@@ -90,7 +82,7 @@ int main() {
 
     // --- Consumer task ---
     {
-        auto ec = eng.trigger<&consumer_task>();
+        auto ec = eng.template trigger<&consumer_task>();
         if (ec != cgx::reactor::error::ok) {
             std::fprintf(stderr, "consumer trigger failed: %s\n",
                          cgx::reactor::to_string(ec).data());
@@ -99,7 +91,7 @@ int main() {
     }
 
     {
-        auto ec = eng.trigger<&consumer2_task>();
+        auto ec = eng.template trigger<&consumer2_task>();
         if (ec != cgx::reactor::error::ok) {
             std::fprintf(stderr, "consumer2 trigger failed: %s\n",
                          cgx::reactor::to_string(ec).data());
@@ -110,7 +102,7 @@ int main() {
     // --- Producer task ---
     std::uint8_t value = 1;
     {
-        auto ec = eng.trigger<&producer_task>(value);
+        auto ec = eng.template trigger<&producer_task>(value);
         if (ec != cgx::reactor::error::ok) {
             std::fprintf(stderr, "producer trigger failed: %s\n",
                          cgx::reactor::to_string(ec).data());
@@ -120,7 +112,7 @@ int main() {
 
     // --- Fire-and-return task ---
     {
-        auto ec = eng.trigger<&hello_task>();
+        auto ec = eng.template trigger<&hello_task>();
         if (ec != cgx::reactor::error::ok) {
             std::fprintf(stderr, "hello trigger failed: %s\n",
                          cgx::reactor::to_string(ec).data());

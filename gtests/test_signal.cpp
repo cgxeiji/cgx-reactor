@@ -10,8 +10,11 @@ namespace {
 // NOTE: We do NOT use `using namespace cgx::reactor` here because the
 // POSIX `<sys/signal.h>` (pulled in indirectly via <coroutine> or other
 // standard headers) declares `signal()` in the global namespace, which
-// clashes with `cgx::reactor::signal`.  Instead we use a short alias.
+// clashes with `cgx::reactor::signal`.  Instead we use a short alias
+// for types/values and a separate `using` declaration for the tag UDL
+// (UDLs cannot be reached via a namespace alias).
 namespace cr = cgx::reactor;
+using cgx::reactor::operator""_tag;
 
 using namespace std::chrono_literals;
 
@@ -80,10 +83,10 @@ TEST(SignalTest, SingleListener) {
     cr::signal<int> sig;
     int result = 0;
 
-    cr::engine<cr::default_config, cr::test::mock_clock,
-               &one_shot_listener> eng;
+    auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
+        cr::register_task<"ONE_"_tag, &one_shot_listener>());
 
-    auto ec = eng.trigger<&one_shot_listener>(sig, result);
+    auto ec = eng.template trigger<&one_shot_listener>(sig, result);
     ASSERT_EQ(ec, cr::error::ok);
 
     // Task should be suspended at listen().
@@ -104,12 +107,17 @@ TEST(SignalTest, ThreeListenersAllReceiveValue) {
     cr::signal<int> sig;
     int r1 = 0, r2 = 0, r3 = 0;
 
-    cr::engine<cr::default_config, cr::test::mock_clock,
-               &listener_a, &listener_b, &listener_c> eng;
+    auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
+        cr::register_task<"LST1"_tag, &listener_a>(),
+        cr::register_task<"LST2"_tag, &listener_b>(),
+        cr::register_task<"LST3"_tag, &listener_c>());
 
-    ASSERT_EQ(eng.trigger<&listener_a>(sig, r1), cr::error::ok);
-    ASSERT_EQ(eng.trigger<&listener_b>(sig, r2), cr::error::ok);
-    ASSERT_EQ(eng.trigger<&listener_c>(sig, r3), cr::error::ok);
+    auto ec = eng.template trigger<&listener_a>(sig, r1);
+    ASSERT_EQ(ec, cr::error::ok);
+    ec = eng.template trigger<&listener_b>(sig, r2);
+    ASSERT_EQ(ec, cr::error::ok);
+    ec = eng.template trigger<&listener_c>(sig, r3);
+    ASSERT_EQ(ec, cr::error::ok);
 
     // All three are now suspended at listen().
     EXPECT_EQ(r1, 0);
@@ -131,11 +139,11 @@ TEST(SignalTest, MultipleCycles) {
     cr::signal<int> sig;
     int out1 = 0, out2 = 0;
 
-    cr::engine<cr::default_config, cr::test::mock_clock,
-               &two_cycle_listener> eng;
+    auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
+        cr::register_task<"TWOC"_tag, &two_cycle_listener>());
 
-    ASSERT_EQ(eng.trigger<&two_cycle_listener>(sig, out1, out2),
-              cr::error::ok);
+    auto ec = eng.template trigger<&two_cycle_listener>(sig, out1, out2);
+    ASSERT_EQ(ec, cr::error::ok);
 
     // Cycle 1
     sig.fire(10);
@@ -156,17 +164,19 @@ TEST(SignalTest, ListenerLimitExceeded) {
     cr::signal<int, 1> sig;
     bool overflow = false;
 
-    cr::engine<cr::default_config, cr::test::mock_clock,
-               &filler, &overflow_detector> eng;
+    auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
+        cr::register_task<"FILL"_tag, &filler>(),
+        cr::register_task<"OVER"_tag, &overflow_detector>());
 
     // Fill the single listener slot.
-    ASSERT_EQ(eng.trigger<&filler>(sig), cr::error::ok);
+    auto ec = eng.template trigger<&filler>(sig);
+    ASSERT_EQ(ec, cr::error::ok);
 
     // The next listen() should detect overflow.  Because the overflow
     // checker never suspends (await_suspend returns false), it runs to
     // completion during trigger().  The slot is free again immediately.
-    ASSERT_EQ(eng.trigger<&overflow_detector>(sig, overflow),
-              cr::error::ok);
+    ec = eng.template trigger<&overflow_detector>(sig, overflow);
+    ASSERT_EQ(ec, cr::error::ok);
     EXPECT_TRUE(overflow);
 }
 
@@ -201,14 +211,16 @@ TEST(SignalTest, EngineIntegration) {
     int counter = 42;
     int received = 0;
 
-    cr::engine<cr::default_config, cr::test::mock_clock,
-               &consumer, &producer> eng;
+    auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
+        cr::register_task<"CNSM"_tag, &consumer>(),
+        cr::register_task<"PROD"_tag, &producer>());
 
     // Trigger consumer FIRST so its timer sits at index 0 and will be
     // processed before the producer's timer in tick() step (b).
-    ASSERT_EQ(eng.trigger<&consumer>(sig, received),
-              cr::error::ok);
-    ASSERT_EQ(eng.trigger<&producer>(sig, counter), cr::error::ok);
+    auto ec = eng.template trigger<&consumer>(sig, received);
+    ASSERT_EQ(ec, cr::error::ok);
+    ec = eng.template trigger<&producer>(sig, counter);
+    ASSERT_EQ(ec, cr::error::ok);
 
     EXPECT_EQ(received, 0);
 

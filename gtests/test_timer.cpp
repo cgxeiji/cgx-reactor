@@ -23,10 +23,11 @@ task delayed_increment(int& counter) {
 
 TEST(TimerTest, SuspendUntilExpiry) {
     int counter = 0;
-    engine<default_config, test::mock_clock, &delayed_increment> eng;
+    auto eng = make_engine<default_config, test::mock_clock>(
+        register_task<"DELY"_tag, &delayed_increment>());
 
     // Trigger the task (suspends at delay_ms).
-    auto ec = eng.trigger<&delayed_increment>(counter);
+    auto ec = eng.template trigger<&delayed_increment>(counter);
     ASSERT_EQ(ec, error::ok);
     EXPECT_EQ(counter, 0);  // Not incremented yet.
 
@@ -62,13 +63,14 @@ TEST(TimerTest, TwoTasksDifferentDelays) {
     int first_done = 0;
     int second_done = 0;
 
-    engine<default_config, test::mock_clock,
-           &first_task, &second_task> eng;
+    auto eng = make_engine<default_config, test::mock_clock>(
+        register_task<"FIRST"_tag, &first_task>(),
+        register_task<"SCND"_tag, &second_task>());
 
-    auto ec1 = eng.trigger<&first_task>(order, first_done);
+    auto ec1 = eng.template trigger<&first_task>(order, first_done);
     ASSERT_EQ(ec1, error::ok);
 
-    auto ec2 = eng.trigger<&second_task>(order, second_done);
+    auto ec2 = eng.template trigger<&second_task>(order, second_done);
     ASSERT_EQ(ec2, error::ok);
 
     // Advance 100ms → first task should fire.
@@ -88,9 +90,7 @@ TEST(TimerTest, TwoTasksDifferentDelays) {
 // -----------------------------------------------------------------------
 
 TEST(TimerTest, QueueFull) {
-    // Use a dummy task pointer — this test only exercises add_timer directly.
-    auto noop = []() -> task { co_return; };
-    engine<default_config, test::mock_clock> eng;
+    auto eng = make_engine<default_config, test::mock_clock>();
 
     // Fill the timer queue via the engine's add_timer internal API.
     auto some_time = test::mock_clock::now() + 1h;
@@ -118,9 +118,10 @@ task periodic_counter(int& count) {
 
 TEST(TimerTest, PeriodicTaskFiveIterations) {
     int count = 0;
-    engine<default_config, test::mock_clock, &periodic_counter> eng;
+    auto eng = make_engine<default_config, test::mock_clock>(
+        register_task<"PERI"_tag, &periodic_counter>());
 
-    auto ec = eng.trigger<&periodic_counter>(count);
+    auto ec = eng.template trigger<&periodic_counter>(count);
     ASSERT_EQ(ec, error::ok);
     EXPECT_EQ(count, 0);
 

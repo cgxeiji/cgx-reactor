@@ -51,6 +51,12 @@ cr::task two_cycle_listener(cr::signal<int>& sig, int& out1, int& out2) {
     co_return;
 }
 
+// Listener that takes a const signal reference — tests const-listen.
+cr::task const_listener(cr::signal<int> const& sig, int& out) {
+    out = co_await sig.listen();
+    co_return;
+}
+
 // Listener that fills one slot — used for the overflow test.
 cr::task filler(cr::signal<int, 1>& sig) {
     (void)co_await sig.listen();
@@ -97,6 +103,25 @@ TEST(SignalTest, SingleListener) {
     // The listener was resumed directly inside fire() and ran to
     // completion, setting result = 42.
     EXPECT_EQ(result, 42);
+}
+
+// -----------------------------------------------------------------------
+// Test 2b — listen() through a const reference (const-correctness test)
+// -----------------------------------------------------------------------
+
+TEST(SignalTest, ListenThroughConstRef) {
+    cr::signal<int> sig;
+    int result = 0;
+
+    auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
+        cr::register_task<"CNST"_tag, &const_listener>());
+
+    auto ec = eng.template trigger<&const_listener>(sig, result);
+    ASSERT_EQ(ec, cr::error::ok);
+    EXPECT_EQ(result, 0);
+
+    sig.fire(77);
+    EXPECT_EQ(result, 77);
 }
 
 // -----------------------------------------------------------------------

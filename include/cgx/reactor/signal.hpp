@@ -31,6 +31,10 @@ namespace cgx::reactor {
 /// \tparam T            Value type carried by the signal.
 /// \tparam MaxListeners Maximum number of concurrently suspended listeners.
 ///                      Defaults to the config-provided value.
+///
+/// \note  Lifetime: when used as a class member, the signal must outlive all
+///        coroutines suspended on it.  Destroying the owning object while a
+///        listener is suspended produces a dangling reference.
 template <typename T, std::size_t MaxListeners = default_config::max_signal_listeners>
 class signal {
     /// Per-listener bookkeeping entry.
@@ -39,8 +43,8 @@ class signal {
         std::coroutine_handle<> handle;
     };
 
-    std::array<listener_entry, MaxListeners> listeners_;
-    std::size_t count_ = 0;
+    mutable std::array<listener_entry, MaxListeners> listeners_;
+    mutable std::size_t count_ = 0;
 
 public:
     // -----------------------------------------------------------------------
@@ -55,7 +59,7 @@ public:
     struct listen_awaiter {
         T value_{};
         error ec_{error::ok};
-        signal* self_;
+        const signal* self_;
 
         /// Never ready — always suspend (unless the listener array is full).
         bool await_ready() const noexcept { return false; }
@@ -91,7 +95,7 @@ public:
     /// If the listener array is full, the awaitable does NOT suspend and
     /// await_resume returns a default-constructed T.  Check the awaiter's
     /// `ec` member for error::listener_limit_exceeded.
-    listen_awaiter listen() { return listen_awaiter{{}, {}, this}; }
+    listen_awaiter listen() const { return listen_awaiter{{}, {}, this}; }
 
     // -----------------------------------------------------------------------
     // fire
@@ -102,6 +106,10 @@ public:
     /// Each listener is resumed synchronously during this call.  The
     /// internal listener array is cleared after all listeners have been
     /// notified.
+    ///
+    /// \note  Non-const by design.  Paired with const listen(), this prevents
+    ///        consumers from calling fire() through a const getter (the
+    ///        recommended encapsulation pattern).
     ///
     /// \warning Re-entrant calls to fire() or listen() from within a
     ///          listener's resumption produce undefined behaviour.

@@ -19,7 +19,7 @@ A standalone pub/sub primitive for inter-coroutine communication. Tasks can `lis
 _Avoid_: Event, message, broadcast
 
 **Channel**:
-A standalone point-to-point communication primitive with a bounded buffer. Unlike signals (broadcast), channels implement work distribution — each value is consumed by exactly one consumer. Provides blocking `push()`/`pop()` with awaiters, non-blocking `try_push()` for ISR contexts, and `close()` to signal shutdown. The engine doesn't manage channels — they resume coroutines directly via awaiters.
+A standalone point-to-point communication primitive with a bounded buffer. Unlike signals (broadcast), channels implement work distribution — each value is consumed by exactly one consumer. Provides blocking `push()`/`pop()` with awaiters, non-blocking `try_push()` for ISR contexts, and `close()` to signal shutdown. `pop()` is const-qualified so a `const channel&` can receive (mirrors Go's receive-only `<-chan T` pattern). The engine doesn't manage channels — they resume coroutines directly via awaiters.
 _Avoid_: Queue, pipe, mailbox, FIFO (though implementation is a FIFO ring buffer)
 
 **Clock**:
@@ -128,7 +128,7 @@ _Avoid_: Exception, status code, result
 - A **Task** can `listen()` to a **Signal** (suspends until signal fires)
 - A **Task** can `fire()` a **Signal** (broadcasts to all suspended listeners)
 - A **Task** can `co_await channel.push(value)` to send (suspends if buffer full)
-- A **Task** can `co_await channel.pop()` to receive (suspends if buffer empty, returns `std::optional<T>`)
+- A **Task** can `co_await channel.pop()` to receive (suspends if buffer empty, returns `std::optional<T>`) — `pop()` is const-qualified, so a `const channel&` can receive (mirrors Go's `<-chan T`)
 - A **Task** can call `channel.try_push(value)` for non-blocking send (ISR-safe)
 - An **Engine** uses a **Clock** to determine timer expiry
 - A **Signal** is standalone — not managed by the engine
@@ -171,6 +171,9 @@ _Avoid_: Exception, status code, result
 
 > **Dev:** "Can I filter which log levels are shown?"
 > **Domain expert:** "Yes — set `Config::min_level` to `log_level::debug`, `log_level::info`, `log_level::warn`, or `log_level::error`. Messages below the threshold are eliminated at compile time. The default is `log_level::info`, so debug messages are suppressed unless you change it."
+
+> **Dev:** "Can a const channel reference receive data?"
+> **Domain expert:** "Yes — `pop()` is const-qualified, so `const channel<int, 16>&` can pop. This mirrors Go's receive-only `<-chan T` pattern. A consumer takes a const reference, a producer needs a mutable one. The compiler enforces the contract: you can't push through a const reference."
 
 ## Flagged ambiguities
 

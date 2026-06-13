@@ -40,6 +40,7 @@ All barebones items are complete (this milestone was reached before the refactor
 - **~~Signal/channel logging~~** — Logger template param added to signal and channel (third param, default `no_logger`). Signal logs: fire broadcast, listener registered, capacity exceeded. Channel logs: push/pop/try_push outcomes, close events. Tags: `<reactor::signal>`, `<reactor::channel>`.
 - **~~Logger example~~** — `examples/logger/` demonstrates custom stdout_logger with engine, signal, and channel logging.
 - **~~Test coverage~~** — 13 tests in `test_logger.cpp`: custom capture, timestamp format, level filtering, no_logger suppression, tag format, full timer flow, already-running, capacity exceeded.
+- **~~Const channel pop~~** — `pop()` is now const-qualified, mirroring `signal::listen()`. A `const channel&` can receive (Go's `<-chan T` pattern). Internal buffer/wait-queue members are `mutable`. `push()`/`try_push()`/`close()` remain non-const.
 
 ## Upcoming
 

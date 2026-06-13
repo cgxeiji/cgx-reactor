@@ -71,7 +71,7 @@ public:
         ///                 with a default-constructed value and ec_ = full.
         bool await_suspend(std::coroutine_handle<> h) noexcept {
             if (self_->count_ >= self_->listeners_.size()) {
-                ec_ = error::listener_limit_exceeded;
+                ec_ = error::capacity_exceeded;
                 return false;  // resume immediately with error
             }
             self_->listeners_[self_->count_++] = {&value_, h};

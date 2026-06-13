@@ -68,7 +68,7 @@ cr::task filler(cr::signal<int, 1>& sig) {
 cr::task overflow_detector(cr::signal<int, 1>& sig, bool& detected) {
     auto aw = sig.listen();
     (void)co_await aw;
-    detected = (aw.ec_ == cr::error::listener_limit_exceeded);
+    detected = (aw.ec_ == cr::error::capacity_exceeded);
     co_return;
 }
 

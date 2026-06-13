@@ -1,8 +1,10 @@
-.PHONY: test example_basic example_error_handling example_member_task example_channel
+.PHONY: test examples example_basic example_error_handling example_member_task example_channel
 
 test:
 	cmake --build build --target cgx-reactor-tests
 	ctest --test-dir build --output-on-failure
+
+examples: example_basic example_error_handling example_member_task example_channel
 
 example_basic:
 	cmake --build build --target cgx-reactor-basic

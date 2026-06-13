@@ -56,7 +56,7 @@ Task is waiting on something (timer expiry, signal fire, etc.). Not running, not
 ### Configuration
 
 **Config**:
-Compile-time policy struct passed as template parameter to engine. Specifies max_timers, max_signal_listeners, and optionally task_frame_size (defaults to 1024 bytes).
+Compile-time policy struct passed as template parameter to engine. Specifies max_timers, max_signal_listeners, optionally task_frame_size (defaults to 1024 bytes), and min_level (log level filter, defaults to `log_level::info`).
 _Avoid_: Settings, options, parameters
 
 ### Engine Operations
@@ -94,6 +94,24 @@ auto eng = make_engine<Config, Clock>(specs...);
 ```
 _Avoid_: Create engine, build engine
 
+### Logger
+
+**Logger**:
+Compile-time policy type (`cgx::reactor::logger`) that the user specializes with a `print(const char* msg)` method. The reactor formats log messages (clock, level, tag, message) and calls `logger::print()` with the final string. Default is `no_logger` (empty `print()`, compiler eliminates all logging).
+_Avoid_: Log handler, log backend, log sink
+
+**No Logger**:
+The default logger type (`cgx::reactor::no_logger`). Its `print()` method is empty. When used with `if constexpr` on `Config::min_level`, the compiler eliminates all log formatting and calls — zero codegen.
+_Avoid_: Null logger, void logger
+
+**Log**:
+Static API for log calls. Provides `log::info()`, `log::debug()`, `log::warn()`, `log::error()`. Each is a variadic template that formats a message (printf-style) with clock timestamp, level, and tag prefix, then calls `logger::print()`.
+_Avoid_: log_info, log_debug (free functions)
+
+**Log Level**:
+Compile-time enum class (`cgx::reactor::log_level`) with values: `debug`, `info`, `warn`, `error`. Used with `Config::min_level` to filter log output at compile time.
+_Avoid_: Severity, log priority
+
 ### Error Handling
 
 **Error**:
@@ -115,6 +133,12 @@ _Avoid_: Exception, status code, result
 - An **Engine** uses a **Clock** to determine timer expiry
 - A **Signal** is standalone — not managed by the engine
 - A **Channel** is standalone — not managed by the engine
+- An **Engine** optionally accepts a **Logger** template parameter (third param in `make_engine<Config, Clock, Logger>(...)`, defaults to **no_logger**)
+- **Signal** and **Channel** also accept an optional **Logger** template parameter (third param, defaults to **no_logger**)
+- The **Logger** is a compile-time policy — when `no_logger` is used, all log formatting is eliminated by the compiler via double `if constexpr`
+- **Log Level** filtering is controlled by `Config::min_level` — messages below the threshold are eliminated at compile time
+- **Signal** logs with `<reactor::signal>` tag: fire broadcast, listener registered, capacity exceeded
+- **Channel** logs with `<reactor::channel>` tag: push/pop/try_push outcomes, close events
 
 ## Example dialogue
 
@@ -138,6 +162,15 @@ _Avoid_: Exception, status code, result
 
 > **Dev:** "Is the timer queue part of the engine or a signal?"
 > **Domain expert:** "The timer queue is managed by the engine internally. Signals are standalone — they resume coroutines directly. They're separate mechanisms that serve different purposes."
+
+> **Dev:** "How do I enable logging?"
+> **Domain expert:** "Pass a logger type as the third template parameter to `make_engine`: `make_engine<Config, Clock, my_logger>(...)`. Your logger needs a `static void print(const char* msg)` method. By default, `no_logger` is used and all logging is eliminated at compile time — zero cost."
+
+> **Dev:** "What does the log output look like?"
+> **Domain expert:** "Each message is formatted as `{clock_ms} [{LEVEL}] <reactor::task::TAG> message`. For example: `12345 [INF] <reactor::task::TEMP> triggered`. The clock is raw milliseconds from `Clock::now()`, the level is INF/DBG/WRN/ERR, and the tag is the task's registered tag."
+
+> **Dev:** "Can I filter which log levels are shown?"
+> **Domain expert:** "Yes — set `Config::min_level` to `log_level::debug`, `log_level::info`, `log_level::warn`, or `log_level::error`. Messages below the threshold are eliminated at compile time. The default is `log_level::info`, so debug messages are suppressed unless you change it."
 
 ## Flagged ambiguities
 

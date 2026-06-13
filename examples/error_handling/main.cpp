@@ -10,6 +10,7 @@ struct small_config {
     static constexpr std::size_t max_timers = 2;           // Only 2 timers allowed
     static constexpr std::size_t max_signal_listeners = 2; // Only 2 listeners allowed
     static constexpr std::size_t task_frame_size = 64;
+    static constexpr log_level min_level = log_level::info;
 };
 
 using signal_t = cgx::reactor::signal<int, 2>;

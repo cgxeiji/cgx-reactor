@@ -3,6 +3,7 @@
 #include <cgx/reactor/error.hpp>
 #include <cgx/reactor/config.hpp>
 #include <cgx/reactor/clock.hpp>
+#include <cgx/reactor/logger.hpp>
 #include <cgx/reactor/task.hpp>
 #include <cgx/reactor/timer.hpp>
 #include <cgx/reactor/signal.hpp>

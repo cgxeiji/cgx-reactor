@@ -2,6 +2,7 @@
 
 #include <cgx/reactor/config.hpp>
 #include <cgx/reactor/error.hpp>
+#include <cgx/reactor/logger.hpp>
 
 #include <array>
 #include <coroutine>
@@ -35,7 +36,8 @@ namespace cgx::reactor {
 /// \note  Lifetime: when used as a class member, the signal must outlive all
 ///        coroutines suspended on it.  Destroying the owning object while a
 ///        listener is suspended produces a dangling reference.
-template <typename T, std::size_t MaxListeners = default_config::max_signal_listeners>
+template <typename T, std::size_t MaxListeners = default_config::max_signal_listeners,
+          typename Logger = no_logger>
 class signal {
     /// Per-listener bookkeeping entry.
     struct listener_entry {
@@ -72,16 +74,23 @@ public:
         bool await_suspend(std::coroutine_handle<> h) noexcept {
             if (self_->count_ >= self_->listeners_.size()) {
                 ec_ = error::capacity_exceeded;
+                log::detail::log_impl<default_config, log_level::error, Logger, steady_clock>(
+                    "ERR", "reactor::signal", "listener capacity exceeded (%zu/%zu)",
+                    self_->count_, self_->listeners_.size());
                 return false;  // resume immediately with error
             }
             self_->listeners_[self_->count_++] = {&value_, h};
-            
+
+            log::detail::log_impl<default_config, log_level::debug, Logger, steady_clock>(
+                "DBG", "reactor::signal", "listener registered (%zu/%zu capacity)",
+                self_->count_, self_->listeners_.size());
+
             // Mark this task as suspended on an external event (signal)
             auto& reg = detail::current_external_suspension_registrar;
             if (reg.fn && reg.ctx) {
                 reg.fn(reg.ctx, h);
             }
-            
+
             return true;  // suspend
         }
 
@@ -119,6 +128,10 @@ public:
         // listen() call from within a resumed coroutine registers
         // fresh entries rather than modifying the current batch.
         count_ = 0;
+
+        log::detail::log_impl<default_config, log_level::info, Logger, steady_clock>(
+            "INF", "reactor::signal", "fired to %zu listener(s)", n);
+
         for (std::size_t i = 0; i < n; ++i) {
             *listeners_[i].value_ptr = value;
             listeners_[i].handle.resume();

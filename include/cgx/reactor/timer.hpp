@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cgx/reactor/error.hpp>
+#include <cgx/reactor/logger.hpp>
 
 #include <chrono>
 #include <coroutine>

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cgx/reactor/error.hpp>
+#include <cgx/reactor/logger.hpp>
 #include <cgx/reactor/timer.hpp>
 
 #include <array>
@@ -41,7 +42,7 @@ namespace cgx::reactor {
 /// \tparam T        Value type.
 /// \tparam Capacity Maximum buffered elements (also bounds the number of
 ///                  suspended producers and consumers).  Must be > 0.
-template <typename T, std::size_t Capacity>
+template <typename T, std::size_t Capacity, typename Logger = no_logger>
 class channel {
     static_assert(Capacity > 0, "Channel capacity must be > 0");
     // Ring buffer for queued data.
@@ -86,6 +87,8 @@ public:
             //    closed channel always fails, consistent with try_push().
             if (self_->closed_) {
                 ec_ = error::closed;
+                log::detail::log_impl<default_config, log_level::error, Logger, steady_clock>(
+                    "ERR", "reactor::channel", "push rejected, channel closed");
                 return false;
             }
 
@@ -100,6 +103,8 @@ public:
                 --self_->cons_count_;
                 h_cons.resume();
                 ec_ = error::ok;
+                log::detail::log_impl<default_config, log_level::debug, Logger, steady_clock>(
+                    "DBG", "reactor::channel", "pushed, handed off to consumer");
                 return false;
             }
 
@@ -109,11 +114,18 @@ public:
                 self_->tail_ = (self_->tail_ + 1) % Capacity;
                 ++self_->count_;
                 ec_ = error::ok;
+                log::detail::log_impl<default_config, log_level::debug, Logger, steady_clock>(
+                    "DBG", "reactor::channel", "pushed, buffered (%zu/%zu capacity)",
+                    self_->count_, Capacity);
                 return false;
             }
 
             // 4) Buffer full and not closed — register as producer waiter.
             self_->prod_waiters_[self_->prod_count_++] = {&value_, h};
+
+            log::detail::log_impl<default_config, log_level::warn, Logger, steady_clock>(
+                "WRN", "reactor::channel", "push suspended, buffer full (%zu/%zu)",
+                self_->count_, Capacity);
 
             // Notify the engine that this task is suspended on an external
             // event, so tick() doesn't treat it as directly-runnable.
@@ -160,6 +172,12 @@ public:
                         self_->prod_waiters_[i] = self_->prod_waiters_[i + 1];
                     --self_->prod_count_;
                     h_prod.resume();
+
+                    log::detail::log_impl<default_config, log_level::debug, Logger, steady_clock>(
+                        "DBG", "reactor::channel", "popped, handed off from producer");
+                } else {
+                    log::detail::log_impl<default_config, log_level::debug, Logger, steady_clock>(
+                        "DBG", "reactor::channel", "popped, buffer had data");
                 }
 
                 return false;
@@ -168,11 +186,16 @@ public:
             // 2) Closed — return empty.
             if (self_->closed_) {
                 result_ = std::nullopt;
+                log::detail::log_impl<default_config, log_level::info, Logger, steady_clock>(
+                    "INF", "reactor::channel", "pop returning nullopt, channel closed");
                 return false;
             }
 
             // 3) Empty and not closed — register as consumer waiter.
             self_->cons_waiters_[self_->cons_count_++] = {&result_, h};
+
+            log::detail::log_impl<default_config, log_level::warn, Logger, steady_clock>(
+                "WRN", "reactor::channel", "pop suspended, buffer empty");
 
             // Notify the engine that this task is suspended on an external
             // event, so tick() doesn't treat it as directly-runnable.
@@ -223,7 +246,11 @@ public:
     /// \note  If a consumer is suspended on pop(), try_push() will resume it
     ///        immediately (including from ISR context).
     error try_push(T value) {
-        if (closed_) return error::closed;
+        if (closed_) {
+            log::detail::log_impl<default_config, log_level::error, Logger, steady_clock>(
+                "ERR", "reactor::channel", "try_push rejected, channel closed");
+            return error::closed;
+        }
 
         // Hand off to a waiting consumer.
         if (cons_count_ > 0) {
@@ -234,6 +261,8 @@ public:
                 cons_waiters_[i] = cons_waiters_[i + 1];
             --cons_count_;
             h.resume();
+            log::detail::log_impl<default_config, log_level::debug, Logger, steady_clock>(
+                "DBG", "reactor::channel", "try_push handed off to consumer");
             return error::ok;
         }
 
@@ -242,9 +271,14 @@ public:
             buffer_[tail_] = std::move(value);
             tail_ = (tail_ + 1) % Capacity;
             ++count_;
+            log::detail::log_impl<default_config, log_level::debug, Logger, steady_clock>(
+                "DBG", "reactor::channel", "try_push buffered (%zu/%zu capacity)",
+                count_, Capacity);
             return error::ok;
         }
 
+        log::detail::log_impl<default_config, log_level::warn, Logger, steady_clock>(
+            "WRN", "reactor::channel", "try_push rejected, buffer full");
         return error::capacity_exceeded;
     }
 
@@ -263,6 +297,10 @@ public:
             *cons_waiters_[i].dest_ptr = std::nullopt;
             cons_waiters_[i].handle.resume();
         }
+
+        log::detail::log_impl<default_config, log_level::info, Logger, steady_clock>(
+            "INF", "reactor::channel", "closed, woke %zu producer(s) and %zu consumer(s)",
+            prod_count_, cons_count_);
 
         prod_count_ = 0;
         cons_count_ = 0;

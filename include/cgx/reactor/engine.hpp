@@ -3,6 +3,7 @@
 #include <cgx/reactor/task.hpp>
 #include <cgx/reactor/config.hpp>
 #include <cgx/reactor/error.hpp>
+#include <cgx/reactor/logger.hpp>
 #include <cgx/reactor/timer.hpp>
 #include <cgx/reactor/task_list.hpp>
 
@@ -17,7 +18,7 @@
 namespace cgx::reactor {
 
 // Forward declaration (needed by engine_from_desc_list)
-template <typename Config, typename Clock, typename... Entries>
+template <typename Config, typename Clock, typename Logger = no_logger, typename... Entries>
 class engine;
 
 namespace detail {
@@ -36,12 +37,35 @@ struct slot {
 };
 
 // Build engine type from a type_list of descriptors
-template <typename Config, typename Clock, typename List>
+template <typename Config, typename Clock, typename Logger, typename List>
 struct engine_from_desc_list;
 
-template <typename Config, typename Clock, typename... Ds>
-struct engine_from_desc_list<Config, Clock, detail::type_list<Ds...>> {
-    using type = engine<Config, Clock, Ds...>;
+template <typename Config, typename Clock, typename Logger, typename... Ds>
+struct engine_from_desc_list<Config, Clock, Logger, detail::type_list<Ds...>> {
+    using type = engine<Config, Clock, Logger, Ds...>;
+};
+
+// Compile-time concatenation of "reactor::task::" with a task tag.
+// Produces strings like "reactor::task::FLSH" for use in log points.
+template <typename TagType>
+struct prefixed_tag {
+    static constexpr const char prefix[] = "reactor::task::";
+    static constexpr std::size_t prefix_len = sizeof(prefix) - 1;
+    static constexpr auto& suffix = TagType::value;
+    static constexpr std::size_t suffix_len = sizeof(suffix);
+    static constexpr std::size_t total = prefix_len + suffix_len;
+
+    static constexpr auto make() {
+        std::array<char, total> arr{};
+        for (std::size_t i = 0; i < prefix_len; ++i)
+            arr[i] = prefix[i];
+        for (std::size_t i = 0; i < suffix_len; ++i)
+            arr[prefix_len + i] = suffix[i];
+        return arr;
+    }
+
+    static constexpr auto arr = make();
+    static constexpr const char* value = arr.data();
 };
 
 }  // namespace detail
@@ -54,9 +78,26 @@ struct engine_from_desc_list<Config, Clock, detail::type_list<Ds...>> {
 ///                    produced by make_engine or directly via unfold_specs.
 ///
 /// Each task is uniquely identified by its function pointer (NTTP).
-template <typename Config, typename ClockType, typename... Entries>
+template <typename Config, typename ClockType, typename Logger, typename... Entries>
 class engine {
     static constexpr std::size_t num_tasks = sizeof...(Entries);
+
+    // Compile-time tag strings for log points (indexed by slot position).
+    // Includes the "reactor::task::" prefix so log_impl produces
+    // "<reactor::task::TAG>" without needing a hardcoded prefix in the format.
+    static constexpr std::array<const char*, num_tasks> tag_strings_ = {{
+        detail::prefixed_tag<typename Entries::tag_type>::value...
+    }};
+
+    // Find the slot index for a given coroutine handle (runtime lookup)
+    std::size_t find_slot_for_handle(std::coroutine_handle<> h) const noexcept {
+        for (std::size_t i = 0; i < num_tasks; ++i) {
+            if (slots_[i].current_task.handle() == h) {
+                return i;
+            }
+        }
+        return num_tasks; // not found
+    }
 
     // Per-task slot storage size.
     // Override by defining Config::task_frame_size, otherwise 1024.
@@ -134,9 +175,29 @@ public:
     error add_timer(std::chrono::steady_clock::time_point wake,
                     std::coroutine_handle<> h) noexcept {
         if (timer_count_ >= Config::max_timers) {
+            // Log: capacity exceeded
+            std::size_t slot_idx = find_slot_for_handle(h);
+            const char* tag = (slot_idx < num_tasks) ? tag_strings_[slot_idx]
+                                                     : "unknown";
+            log::detail::log_impl<Config, log_level::error, Logger, ClockType>(
+                "ERR", tag,
+                "timer capacity exceeded (%zu/%zu)",
+                static_cast<std::size_t>(timer_count_),
+                static_cast<std::size_t>(Config::max_timers));
             return error::capacity_exceeded;
         }
         timers_[timer_count_++] = {wake, h};
+
+        // Log: delay registered
+        std::size_t slot_idx = find_slot_for_handle(h);
+        const char* tag = (slot_idx < num_tasks) ? tag_strings_[slot_idx]
+                                                 : "unknown";
+        auto delay_ms_val = std::chrono::duration_cast<
+            std::chrono::milliseconds>(wake - ClockType::now()).count();
+        log::detail::log_impl<Config, log_level::debug, Logger, ClockType>(
+            "DBG", tag, "delay %lldms registered",
+            static_cast<long long>(delay_ms_val));
+
         return error::ok;
     }
 
@@ -157,6 +218,9 @@ public:
         auto& s = slots_[idx];
 
         if (s.occupied) {
+            log::detail::log_impl<Config, log_level::warn, Logger, ClockType>(
+                "WRN", tag_strings_[idx],
+                "already running, trigger rejected");
             return error::task_already_running;
         }
 
@@ -198,6 +262,9 @@ public:
             s.occupied = true;
         }
 
+        log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
+            "INF", tag_strings_[idx], "triggered");
+
         return error::ok;
     }
 
@@ -207,15 +274,20 @@ public:
         detail::current_external_suspension_registrar = {&mark_suspended, this};
 
         // Clean up completed tasks (e.g., tasks that completed via signal resume)
-        for_each_slot([this](slot_t& s) {
-            if (s.occupied && s.current_task.handle() && s.current_task.handle().done()) {
+        for (std::size_t i = 0; i < num_tasks; ++i) {
+            auto& s = slots_[i];
+            if (s.occupied && s.current_task.handle() &&
+                s.current_task.handle().done()) {
+                log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
+                    "INF", tag_strings_[i], "completed");
                 s.occupied = false;
             }
-        });
+        }
 
         // (a) Resume directly-runnable tasks — occupied, not done,
         //     not suspended on external event, and NOT waiting on a pending timer.
-        for_each_slot([this](slot_t& s) {
+        for (std::size_t i = 0; i < num_tasks; ++i) {
+            auto& s = slots_[i];
             if (s.occupied && s.current_task.handle() &&
                 !s.current_task.handle().done() && !s.suspended) {
                 bool has_timer = false;
@@ -228,11 +300,13 @@ public:
                 if (!has_timer) {
                     s.current_task.handle().resume();
                     if (s.current_task.handle().done()) {
+                        log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
+                            "INF", tag_strings_[i], "completed");
                         s.occupied = false;
                     }
                 }
             }
-        });
+        }
 
         // (b) Collect all expired timers first (maintains FIFO order)
         std::array<std::coroutine_handle<>, Config::max_timers> expired;
@@ -256,18 +330,20 @@ public:
         // (c) Resume all expired timers
         for (std::size_t i = 0; i < expired_count; ++i) {
             auto h = expired[i];
-            for_each_slot([&](slot_t& s) {
-                if (s.current_task.handle() == h) {
-                    s.suspended = false;
-                }
-            });
+            std::size_t slot_idx = find_slot_for_handle(h);
+            if (slot_idx < num_tasks) {
+                log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
+                    "INF", tag_strings_[slot_idx],
+                    "timer expired, resuming");
+                slots_[slot_idx].suspended = false;
+            }
             h.resume();
             if (h.done()) {
-                for_each_slot([&](slot_t& s) {
-                    if (s.current_task.handle() == h) {
-                        s.occupied = false;
-                    }
-                });
+                if (slot_idx < num_tasks) {
+                    log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
+                        "INF", tag_strings_[slot_idx], "completed");
+                    slots_[slot_idx].occupied = false;
+                }
             }
         }
 
@@ -298,10 +374,10 @@ public:
 ///
 /// Each bound is unfolded into one slot per member function (all sharing
 /// the same self pointer).  Each free_spec produces one slot.
-template <typename Config, typename Clock, typename... Specs>
+template <typename Config, typename Clock, typename Logger = no_logger, typename... Specs>
 auto make_engine(Specs&&... specs) {
     using desc_list = typename detail::spec_unfolder<std::decay_t<Specs>...>::type;
-    using eng_t = typename detail::engine_from_desc_list<Config, Clock, desc_list>::type;
+    using eng_t = typename detail::engine_from_desc_list<Config, Clock, Logger, desc_list>::type;
     constexpr std::size_t N = detail::count_slots<std::decay_t<Specs>...>::value;
 
     std::array<void*, N> self_ptrs{};

@@ -31,6 +31,16 @@ All barebones items are complete (this milestone was reached before the refactor
 
 - **~~Queue-based channels~~** — `channel<T, Capacity>` implemented as a standalone primitive (no engine dependency). Ring buffer, blocking push/pop with awaiters, non-blocking try_push, close() with waiter wakeup. Direct resume semantics (same as signals). Error enum extended: `queue_full` renamed to `capacity_exceeded`, `closed` added.
 
+## 2026-06-13 — Logger ✓
+
+- **~~Composable logger~~** — `cgx::reactor::logger` compile-time policy type. Default `no_logger` produces zero codegen (double `if constexpr` eliminates all formatting). User enables via `make_engine<Config, Clock, my_logger>(...)`. Provides `log::info/debug/warn/error` variadic API with printf-style formatting.
+- **~~Log format~~** — `{clock_ms} [{LEVEL}] <reactor::task::TAG> message`. Clock is raw `Clock::now()` in ms. Levels: INF/DBG/WRN/ERR. Tag is the task's registered tag.
+- **~~Level filtering~~** — `Config::min_level` compile-time filter (default: `log_level::info`). Messages below threshold eliminated at compile time.
+- **~~Engine + timer log points~~** — 6 log points: trigger, already-running warning, timer registered, timer capacity exceeded, timer expired, task completed.
+- **~~Signal/channel logging~~** — Logger template param added to signal and channel (third param, default `no_logger`). Signal logs: fire broadcast, listener registered, capacity exceeded. Channel logs: push/pop/try_push outcomes, close events. Tags: `<reactor::signal>`, `<reactor::channel>`.
+- **~~Logger example~~** — `examples/logger/` demonstrates custom stdout_logger with engine, signal, and channel logging.
+- **~~Test coverage~~** — 13 tests in `test_logger.cpp`: custom capture, timestamp format, level filtering, no_logger suppression, tag format, full timer flow, already-running, capacity exceeded.
+
 ## Upcoming
 
 - **`delay_until(time_point)`** — absolute-time awaitable for drift-free periodic tasks

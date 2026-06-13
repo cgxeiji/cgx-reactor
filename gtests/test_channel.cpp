@@ -462,4 +462,36 @@ TEST(ChannelTest, MultipleConsumersFIFO) {
     EXPECT_EQ(*v3, 300);
 }
 
+// -----------------------------------------------------------------------
+// Test 15 — const channel& can call pop() (mirrors Go's <-chan T pattern)
+// -----------------------------------------------------------------------
+
+template <std::size_t Cap>
+cr::task pop_one_const(const cr::channel<int, Cap>& ch,
+                       std::optional<int>& out) {
+    out = co_await ch.pop();
+    co_return;
+}
+
+TEST(ChannelTest, ConstChannelCanPop) {
+    cr::channel<int, 4> ch;
+    std::optional<int> val;
+    cr::error ec;
+
+    auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
+        cr::register_task<"CPUS"_tag, &push_one<4>>(),
+        cr::register_task<"CPOP"_tag, &pop_one_const<4>>());
+
+    // Push a value into the channel first.
+    ASSERT_EQ(eng.template trigger<&push_one<4>>(ch, 42, ec), cr::error::ok);
+    ASSERT_EQ(ec, cr::error::ok);
+
+    // Pop through a const reference — verifies pop() is const-qualified.
+    const auto& cref = ch;
+    ASSERT_EQ(eng.template trigger<&pop_one_const<4>>(cref, val),
+              cr::error::ok);
+    ASSERT_TRUE(val.has_value());
+    EXPECT_EQ(*val, 42);
+}
+
 }  // anonymous namespace

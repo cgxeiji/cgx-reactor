@@ -46,26 +46,28 @@ template <typename T, std::size_t Capacity, typename Logger = no_logger>
 class channel {
     static_assert(Capacity > 0, "Channel capacity must be > 0");
     // Ring buffer for queued data.
-    std::array<T, Capacity> buffer_{};
-    std::size_t head_ = 0;
-    std::size_t tail_ = 0;
-    std::size_t count_ = 0;
+    // buffer_, head_, count_, and the consumer-wait-queue are mutable
+    // so that pop() can be const (mirroring signal::listen()).
+    mutable std::array<T, Capacity> buffer_{};
+    mutable std::size_t head_ = 0;
+    mutable std::size_t tail_ = 0;
+    mutable std::size_t count_ = 0;
 
     // Producer wait queue — producers suspended because buffer was full.
     struct producer_entry {
         T* value_ptr;
         std::coroutine_handle<> handle;
     };
-    std::array<producer_entry, Capacity> prod_waiters_{};
-    std::size_t prod_count_ = 0;
+    mutable std::array<producer_entry, Capacity> prod_waiters_{};
+    mutable std::size_t prod_count_ = 0;
 
     // Consumer wait queue — consumers suspended because buffer was empty.
     struct consumer_entry {
         std::optional<T>* dest_ptr;
         std::coroutine_handle<> handle;
     };
-    std::array<consumer_entry, Capacity> cons_waiters_{};
-    std::size_t cons_count_ = 0;
+    mutable std::array<consumer_entry, Capacity> cons_waiters_{};
+    mutable std::size_t cons_count_ = 0;
 
     bool closed_ = false;
 
@@ -149,7 +151,7 @@ public:
     /// Awaitable returned by pop().
     struct pop_awaiter {
         std::optional<T> result_;
-        channel* self_;
+        const channel* self_;
 
         bool await_ready() const noexcept { return false; }
 
@@ -233,7 +235,11 @@ public:
     ///
     /// Returns the value on success, or std::nullopt if the channel was
     /// closed while (or before) the consumer was waiting.
-    pop_awaiter pop() {
+    ///
+    /// Const-qualified so a const channel& can receive (mirrors Go's
+    /// receive-only <-chan T pattern).  Internal mutation is via mutable
+    /// members, analogous to signal::listen().
+    pop_awaiter pop() const {
         return pop_awaiter{std::nullopt, this};
     }
 

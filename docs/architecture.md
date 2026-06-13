@@ -179,12 +179,20 @@ Tasks suspend via awaitables. Two primary mechanisms:
 
 ### Timer-based Suspension
 
+Three awaitables provide timer-based suspension, all using the same thread-local registrar mechanism:
+
+| Awaitable | Behavior | Drift |
+|-----------|----------|-------|
+| `delay_ms<Clock>(duration)` | Relative delay from now | Accumulates |
+| `delay_until<Clock>(time_point)` | Absolute time point | None (caller manages epoch) |
+| `delay_quantized<Clock>(duration)` | Next grid-aligned tick | None (automatic) |
+
 ```
 Task execution
     ↓
-co_await delay_ms(100)
+co_await delay_ms(100) / delay_until(tp) / delay_quantized(100ms)
     ↓
-delay_ms::await_suspend()
+await_suspend()
     ↓
 Registers with timer queue via thread-local registrar
     ↓
@@ -197,6 +205,23 @@ tick() detects expiry
 Resumes coroutine → task state: running
     ↓
 Task continues execution
+```
+
+**Drift-free periodic scheduling:**
+```cpp
+// Option 1: delay_until — caller manages epoch
+auto next = Clock::now() + 100ms;
+while (running) {
+    co_await delay_until<Clock>(next);
+    next += 100ms;
+    // do work
+}
+
+// Option 2: delay_quantized — automatic grid alignment
+while (running) {
+    co_await delay_quantized<Clock>(100ms);
+    // do work — always wakes on 100ms grid
+}
 ```
 
 ### Signal-based Suspension
@@ -338,7 +363,6 @@ This allows:
 - **No priority** — all tasks are treated equally
 - **No dynamic task registration** — tasks must be known at compile time
 - **No cross-engine signals** — signals are local to a single engine instance
-- **Drift in periodic tasks** — `delay_ms` causes drift; `delay_until` is deferred
 
 ## Future Directions
 
@@ -349,7 +373,7 @@ See [roadmap.md](roadmap.md) for planned features:
 
 ## Examples
 
-Four runnable examples live under `examples/`:
+Five runnable examples live under `examples/`:
 
 | Directory | What it shows |
 |-----------|---------------|
@@ -357,3 +381,4 @@ Four runnable examples live under `examples/`:
 | `examples/error_handling/` | Exercises every error code (`task_already_running`, `capacity_exceeded`, `listener_limit_exceeded`) with a deliberately small `Config` so the limits are easy to hit. |
 | `examples/member_task/` | The hero example for the member-function API. Three classes — two mock sensors and a serial printer consumer — all using `reactor_tasks` aliases and `register_instance`. Run with `make example_member_task`; produces interleaved temperature/pressure readings over ~3 seconds. |
 | `examples/channel/` | Demonstrates point-to-point communication with `channel<T, Capacity>`. Shows ISR-to-task data flow with a UART receiver pushing bytes into a channel, and a processor task consuming them. Illustrates blocking `pop()` for task contexts and non-blocking `try_push()` for ISR contexts. Run with `make example_channel`. |
+| `examples/timer/` | Side-by-side comparison of all three timer primitives. Runs three concurrent tasks — `delay_ms` (drifty), `delay_until` (precise), `delay_quantized` (grid-aligned) — and prints wall-clock timestamps so drift is visually obvious. Run with `make example_timer`. |

@@ -42,9 +42,15 @@ All barebones items are complete (this milestone was reached before the refactor
 - **~~Test coverage~~** — 13 tests in `test_logger.cpp`: custom capture, timestamp format, level filtering, no_logger suppression, tag format, full timer flow, already-running, capacity exceeded.
 - **~~Const channel pop~~** — `pop()` is now const-qualified, mirroring `signal::listen()`. A `const channel&` can receive (Go's `<-chan T` pattern). Internal buffer/wait-queue members are `mutable`. `push()`/`try_push()`/`close()` remain non-const.
 
+## 2026-06-14 — Drift-Free Timers ✓
+
+- **~~`delay_until(time_point)`~~** — absolute-time awaitable for drift-free periodic tasks. Accepts a `Clock::time_point` directly; caller manages epoch. Usage: `co_await delay_until<steady_clock>(next); next += period;`
+- **~~`delay_quantized(interval)`~~** — grid-aligned awaitable that snaps to multiples of the interval from the clock's epoch. Zero drift, no state. Usage: `co_await delay_quantized<steady_clock>(100ms);`
+- **~~Timer example~~** — `examples/timer/` runs three concurrent tasks comparing `delay_ms` (drifty), `delay_until` (precise), and `delay_quantized` (grid-aligned) with wall-clock timestamps.
+- **~~Test coverage~~** — 7 new tests: `DelayUntilTest` (WakeAtExactTime, PastTimePoint, QueueFull), `DelayQuantizedTest` (GridAlignment, DriftFreePeriodic, ExactTickBoundary, QueueFull).
+
 ## Upcoming
 
-- **`delay_until(time_point)`** — absolute-time awaitable for drift-free periodic tasks
 - **Task lifecycle (`cancel()`, `join()`)** — explicit management of running tasks
 - **RP2040 clock implementation** — reference implementation for Pico SDK
 - **Custom awaitable examples** — `next_byte` for UART, `wait_for_pin` for GPIO

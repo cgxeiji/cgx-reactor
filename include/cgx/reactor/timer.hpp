@@ -80,8 +80,8 @@ inline thread_local external_suspension_registrar current_external_suspension_re
 ///
 /// Drift note: delay_ms(N) guarantees the coroutine is resumed at least N ms
 /// after suspension, but not exactly at N ms.  Periodic tasks using
-/// delay_ms will accumulate drift.  Use delay_until for precise periodic
-/// scheduling (not yet implemented).
+/// delay_ms will accumulate drift.  Use delay_until or delay_quantized
+/// for precise periodic scheduling.
 template <typename Clock>
 struct delay_ms {
     using duration = typename Clock::duration;
@@ -112,6 +112,92 @@ struct delay_ms {
 
     /// Returns error::ok on success, or error::queue_full if the timer
     /// queue was exhausted.
+    error await_resume() const noexcept { return result_; }
+};
+
+// ---------------------------------------------------------------------------
+// delay_until awaitable
+// ---------------------------------------------------------------------------
+
+/// Awaitable that suspends the current coroutine until a specific time point.
+///
+/// Unlike delay_ms, this does not accumulate drift when used in a periodic loop:
+///   auto next = Clock::now() + period;
+///   while (running) {
+///       co_await delay_until<Clock>(next);
+///       next += period;
+///       // do work
+///   }
+///
+/// \tparam Clock  A type satisfying the Clock concept.
+template <typename Clock>
+struct delay_until {
+    using time_point = typename Clock::time_point;
+
+    time_point wake_time_;
+    error result_{error::ok};
+
+    explicit delay_until(time_point tp) noexcept : wake_time_(tp) {}
+
+    bool await_ready() const noexcept { return false; }
+
+    bool await_suspend(std::coroutine_handle<> h) noexcept {
+        auto& reg = detail::current_timer_registrar;
+        if (!reg.fn || !reg.ctx) {
+            std::terminate();
+        }
+        result_ = reg.fn(reg.ctx, wake_time_, h);
+        return result_ == error::ok;
+    }
+
+    error await_resume() const noexcept { return result_; }
+};
+
+// ---------------------------------------------------------------------------
+// delay_quantized awaitable
+// ---------------------------------------------------------------------------
+
+/// Awaitable that suspends until the next grid-aligned tick.
+///
+/// Always snaps to the next boundary aligned to the clock epoch:
+///   co_await delay_quantized<steady_clock>(100ms);  // next 100ms tick
+///   co_await delay_quantized<steady_clock>(100ms);  // next 100ms tick
+///
+/// If called exactly on a tick boundary, the next tick is used
+/// (not the current one).  This guarantees zero drift without
+/// needing to track an epoch anchor.
+///
+/// \tparam Clock  A type satisfying the Clock concept.
+template <typename Clock>
+struct delay_quantized {
+    using duration   = typename Clock::duration;
+    using time_point = typename Clock::time_point;
+
+    duration interval_;
+    error result_{error::ok};
+
+    explicit delay_quantized(duration interval) noexcept : interval_(interval) {}
+
+    bool await_ready() const noexcept { return false; }
+
+    bool await_suspend(std::coroutine_handle<> h) noexcept {
+        auto& reg = detail::current_timer_registrar;
+        if (!reg.fn || !reg.ctx) {
+            std::terminate();
+        }
+
+        auto now = Clock::now();
+
+        // Compute the next grid-aligned tick from epoch.
+        // wake = now + (interval - (elapsed % interval))
+        auto elapsed = now.time_since_epoch();
+        auto remainder = elapsed % interval_;
+        auto wake = now + (interval_ - remainder);
+
+        result_ = reg.fn(reg.ctx, wake, h);
+        return result_ == error::ok;
+    }
+
     error await_resume() const noexcept { return result_; }
 };
 

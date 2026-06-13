@@ -26,6 +26,18 @@ _Avoid_: Queue, pipe, mailbox, FIFO (though implementation is a FIFO ring buffer
 A concept wrapping `std::chrono` types. Provides `now()` returning `time_point`. Default implementation uses `std::chrono::steady_clock`. RP2040 provides a clock wrapping Pico SDK timer. Tests provide a mock clock.
 _Avoid_: Timer, time source
 
+**Delay MS**:
+Awaitable that suspends the current coroutine for a relative duration. Guarantees the coroutine is resumed *at least* N ms after suspension, but periodic use accumulates drift because each delay measures from the resume time, not from a fixed epoch. For drift-free periodic scheduling, use `delay_until` or `delay_quantized`.
+_Avoid_: sleep, wait
+
+**Delay Until**:
+Awaitable that suspends the current coroutine until a specific absolute time point. Does not accumulate drift when used in a periodic loop (`next += period` after each wake). The caller manages the epoch. Returns `error::capacity_exceeded` if the timer queue is full.
+_Avoid_: delay_absolute, delay_at
+
+**Delay Quantized**:
+Awaitable that suspends until the next grid-aligned tick relative to the clock's epoch. Snaps to multiples of the interval — e.g., with a 100ms interval, always wakes at 100ms, 200ms, 300ms… regardless of when the call occurs. Zero drift, no state. Returns `error::capacity_exceeded` if the timer queue is full.
+_Avoid_: delay_periodic, delay_aligned
+
 **Tag**:
 A compile-time character sequence (typically 4 chars) used to identify a task slot for debugging and error messages. Constructed via the `"DISP"_tag` user-defined literal (C++20 template UDL, P1040R6) or the escape hatch `make_tag<'D','I','S','P'>()`. The UDL requires a `using` declaration at the call site (`using cgx::reactor::operator""_tag;`).
 _Avoid_: Label, id, name
@@ -174,6 +186,12 @@ _Avoid_: Exception, status code, result
 
 > **Dev:** "Can a const channel reference receive data?"
 > **Domain expert:** "Yes — `pop()` is const-qualified, so `const channel<int, 16>&` can pop. This mirrors Go's receive-only `<-chan T` pattern. A consumer takes a const reference, a producer needs a mutable one. The compiler enforces the contract: you can't push through a const reference."
+
+> **Dev:** "My periodic task drifts — each iteration is slightly longer than the target period."
+> **Domain expert:** "That's `delay_ms` accumulating drift — each delay measures from the resume time, not from a fixed epoch. Use `delay_until` if you want to manage the epoch yourself (`next += period`), or `delay_quantized` if you want automatic grid alignment. Both give zero drift. See `examples/timer/` for a side-by-side comparison."
+
+> **Dev:** "What's the difference between `delay_until` and `delay_quantized`?"
+> **Domain expert:** "`delay_until(time_point)` takes an absolute time — you control the epoch. `delay_quantized(interval)` snaps to the clock's epoch grid automatically. If you're doing `next += 100ms` in a loop, use `delay_until`. If you just want 'every 100ms tick', use `delay_quantized`. Both are drift-free; `delay_quantized` is simpler when you don't need epoch control."
 
 ## Flagged ambiguities
 

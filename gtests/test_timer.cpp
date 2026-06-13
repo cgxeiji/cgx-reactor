@@ -86,7 +86,7 @@ TEST(TimerTest, TwoTasksDifferentDelays) {
 }
 
 // -----------------------------------------------------------------------
-// Test 3: fill timer queue, verify error::queue_full on next delay_ms
+// Test 3: fill timer queue, verify error::capacity_exceeded on next delay_ms
 // -----------------------------------------------------------------------
 
 TEST(TimerTest, QueueFull) {
@@ -101,7 +101,7 @@ TEST(TimerTest, QueueFull) {
 
     // Next add should fail.
     auto ec = eng.add_timer(some_time, std::coroutine_handle<>{});
-    ASSERT_EQ(ec, error::queue_full);
+    ASSERT_EQ(ec, error::capacity_exceeded);
 }
 
 // -----------------------------------------------------------------------

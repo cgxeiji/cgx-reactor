@@ -27,7 +27,7 @@ task long_running_task() {
 }
 
 // ---------------------------------------------------------------------------
-// Error 2: queue_full - three tasks that all try to add timers
+// Error 2: capacity_exceeded - three tasks that all try to add timers
 // ---------------------------------------------------------------------------
 
 task timer_task_a() {
@@ -129,8 +129,8 @@ int main() {
 
     std::cout << "\n";
 
-    // Error 2: queue_full
-    std::cout << "--- Error 2: queue_full ---\n";
+    // Error 2: capacity_exceeded
+    std::cout << "--- Error 2: capacity_exceeded ---\n";
     std::cout << "Triggering 3 tasks that each add a timer (max_timers=2)...\n";
     eng.template trigger<&timer_task_a>();
     eng.template trigger<&timer_task_b>();

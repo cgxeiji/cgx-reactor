@@ -102,6 +102,38 @@ task consumer() {
 }
 ```
 
+### Channel
+
+A point-to-point bounded buffer for inter-task communication. Channels:
+- Are standalone objects (not managed by engine)
+- Implement work distribution (each value consumed by exactly one consumer)
+- Provide blocking `push()`/`pop()` with awaiters
+- Provide non-blocking `try_push()` for ISR contexts
+- Support `close()` to signal shutdown
+- Resume suspended coroutines directly via awaiters
+
+**Example:**
+```cpp
+channel<uint8_t, 16> uart_rx;  // 16-byte buffer
+
+// ISR context (non-blocking)
+void UART_ISR() {
+    uart_rx.try_push(UART->DR);
+}
+
+// Task context (blocking)
+task consumer() {
+    while (auto byte = co_await uart_rx.pop()) {
+        process(*byte);  // each byte consumed by exactly one consumer
+    }
+    // pop() returns std::nullopt when channel is closed
+}
+```
+
+**Signal vs Channel:**
+- **Signal**: broadcast (all listeners get the value), fire-and-forget, no buffering
+- **Channel**: point-to-point (one consumer per value), backpressure (blocks if full), bounded buffer
+
 ## Data Flow
 
 The architecture follows a vertical data flow pattern with clear layering:
@@ -187,6 +219,27 @@ signal::fire() directly resumes coroutine → task state: running
 Task continues execution
 ```
 
+### Channel-based Suspension
+
+```
+Task execution
+    ↓
+co_await channel.pop()
+    ↓
+pop_awaiter::await_suspend()
+    ↓
+If buffer has data → copy to result, return false (no suspend)
+If buffer empty → register in consumer wait queue, suspend
+    ↓
+[producer pushes]
+    ↓
+producer's push_awaiter writes to buffer or hands off to waiting consumer
+    ↓
+Directly resumes waiting consumer → task state: running
+    ↓
+Task continues execution
+```
+
 ## Registration Flow
 
 ### Free-function tasks
@@ -221,6 +274,8 @@ All memory is statically allocated:
 2. **Coroutine frames** — placement-new allocated into slot storage
 3. **Timer queue** — fixed-size array (configurable via `Config::max_timers`)
 4. **Signal listeners** — fixed-size array per signal (configurable via `Config::max_signal_listeners`)
+5. **Channel buffers** — fixed-size ring buffer per channel (compile-time `Capacity` template parameter)
+6. **Channel wait queues** — fixed-size arrays per channel (bounded by `Capacity`)
 
 **No dynamic allocation occurs at runtime.**
 
@@ -238,8 +293,9 @@ This pattern allows awaitables to interact with the engine without explicit para
 All operations return `error` codes:
 - `error::ok` — success
 - `error::task_already_running` — tried to trigger a running task
-- `error::queue_full` — timer or listener queue exhausted
+- `error::capacity_exceeded` — timer queue, listener queue, or channel full
 - `error::listener_limit_exceeded` — too many concurrent listeners
+- `error::closed` — channel was closed by the producer
 
 No exceptions are thrown.
 
@@ -288,16 +344,16 @@ This allows:
 
 See [roadmap.md](roadmap.md) for planned features:
 - `delay_until()` for drift-free periodic tasks
-- Queue-based channels (point-to-point communication)
 - Task lifecycle management (`cancel()`, `join()`)
 - RP2040 clock implementation
 
 ## Examples
 
-Three runnable examples live under `examples/`:
+Four runnable examples live under `examples/`:
 
 | Directory | What it shows |
 |-----------|---------------|
 | `examples/basic/` | Free-function tasks wired through `register_task` + `make_engine`. Producer/consumer over a signal. The simplest end-to-end demo. |
-| `examples/error_handling/` | Exercises every error code (`task_already_running`, `queue_full`, `listener_limit_exceeded`) with a deliberately small `Config` so the limits are easy to hit. |
+| `examples/error_handling/` | Exercises every error code (`task_already_running`, `capacity_exceeded`, `listener_limit_exceeded`) with a deliberately small `Config` so the limits are easy to hit. |
 | `examples/member_task/` | The hero example for the member-function API. Three classes — two mock sensors and a serial printer consumer — all using `reactor_tasks` aliases and `register_instance`. Run with `make example_member_task`; produces interleaved temperature/pressure readings over ~3 seconds. |
+| `examples/channel/` | Demonstrates point-to-point communication with `channel<T, Capacity>`. Shows ISR-to-task data flow with a UART receiver pushing bytes into a channel, and a processor task consuming them. Illustrates blocking `pop()` for task contexts and non-blocking `try_push()` for ISR contexts. Run with `make example_channel`. |

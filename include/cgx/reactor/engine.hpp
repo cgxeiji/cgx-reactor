@@ -134,7 +134,7 @@ public:
     error add_timer(std::chrono::steady_clock::time_point wake,
                     std::coroutine_handle<> h) noexcept {
         if (timer_count_ >= Config::max_timers) {
-            return error::queue_full;
+            return error::capacity_exceeded;
         }
         timers_[timer_count_++] = {wake, h};
         return error::ok;

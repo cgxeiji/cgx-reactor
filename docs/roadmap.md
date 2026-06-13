@@ -27,10 +27,13 @@ All barebones items are complete (this milestone was reached before the refactor
 - **~~RP2040 clock implementation~~** — concept defined, but Pico SDK integration is consumer-side; a reference implementation may be added as an example
 - **~~Custom awaitable examples~~** — `next_byte` for UART etc. deferred; architecture supports them (signals resume handles directly)
 
+## 2026-06-11 — Channels ✓
+
+- **~~Queue-based channels~~** — `channel<T, Capacity>` implemented as a standalone primitive (no engine dependency). Ring buffer, blocking push/pop with awaiters, non-blocking try_push, close() with waiter wakeup. Direct resume semantics (same as signals). Error enum extended: `queue_full` renamed to `capacity_exceeded`, `closed` added.
+
 ## Upcoming
 
 - **`delay_until(time_point)`** — absolute-time awaitable for drift-free periodic tasks
-- **Queue-based channels** — point-to-point communication (single consumer receives the value)
 - **Task lifecycle (`cancel()`, `join()`)** — explicit management of running tasks
 - **RP2040 clock implementation** — reference implementation for Pico SDK
 - **Custom awaitable examples** — `next_byte` for UART, `wait_for_pin` for GPIO

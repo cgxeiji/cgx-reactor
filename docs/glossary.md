@@ -16,7 +16,11 @@ _Avoid_: Coroutine, fiber, thread, job
 
 **Signal**:
 A standalone pub/sub primitive for inter-coroutine communication. Tasks can `listen()` to suspend until the signal fires, or `fire(value)` to broadcast to all listeners. The engine doesn't manage signals — they resume coroutines directly.
-_Avoid_: Channel, event, message, broadcast
+_Avoid_: Event, message, broadcast
+
+**Channel**:
+A standalone point-to-point communication primitive with a bounded buffer. Unlike signals (broadcast), channels implement work distribution — each value is consumed by exactly one consumer. Provides blocking `push()`/`pop()` with awaiters, non-blocking `try_push()` for ISR contexts, and `close()` to signal shutdown. The engine doesn't manage channels — they resume coroutines directly via awaiters.
+_Avoid_: Queue, pipe, mailbox, FIFO (though implementation is a FIFO ring buffer)
 
 **Clock**:
 A concept wrapping `std::chrono` types. Provides `now()` returning `time_point`. Default implementation uses `std::chrono::steady_clock`. RP2040 provides a clock wrapping Pico SDK timer. Tests provide a mock clock.
@@ -93,7 +97,7 @@ _Avoid_: Create engine, build engine
 ### Error Handling
 
 **Error**:
-Enum class representing failure conditions (e.g., `task_already_running`, `queue_full`, `invalid_task`). Functions return `error` or `std::optional<T>` + `error`. No exceptions.
+Enum class representing failure conditions (e.g., `task_already_running`, `capacity_exceeded`, `closed`). Functions return `error` or `std::optional<T>` + `error`. No exceptions.
 _Avoid_: Exception, status code, result
 
 ## Relationships
@@ -105,8 +109,12 @@ _Avoid_: Exception, status code, result
 - A **Tick** resumes expired timer-suspended tasks; signal-suspended tasks resume directly via fire()
 - A **Task** can `listen()` to a **Signal** (suspends until signal fires)
 - A **Task** can `fire()` a **Signal** (broadcasts to all suspended listeners)
+- A **Task** can `co_await channel.push(value)` to send (suspends if buffer full)
+- A **Task** can `co_await channel.pop()` to receive (suspends if buffer empty, returns `std::optional<T>`)
+- A **Task** can call `channel.try_push(value)` for non-blocking send (ISR-safe)
 - An **Engine** uses a **Clock** to determine timer expiry
 - A **Signal** is standalone — not managed by the engine
+- A **Channel** is standalone — not managed by the engine
 
 ## Example dialogue
 
@@ -120,7 +128,10 @@ _Avoid_: Exception, status code, result
 > **Domain expert:** "No — each registered function pointer is a singleton with a fixed slot. If you need multiple instances, use different classes or register each instance with a different tag (each tag creates a separate slot for each member function)."
 
 > **Dev:** "How does a task wait for a UART byte?"
-> **Domain expert:** "You create a `signal<uint8_t> uart_byte`. The task does `auto b = co_await uart_byte.listen()`. When the UART ISR receives a byte, it calls `uart_byte.fire(b)`, which resumes the task."
+> **Domain expert:** "You have two options depending on the pattern. For broadcast (multiple consumers want the byte): create a `signal<uint8_t> uart_byte`. The task does `auto b = co_await uart_byte.listen()`. When the UART ISR receives a byte, it calls `uart_byte.fire(b)`, which resumes all listeners. For point-to-point (one consumer processes the byte): create a `channel<uint8_t, 16> uart_rx`. The task does `auto b = co_await uart_rx.pop()`. The ISR calls `uart_rx.try_push(b)` (non-blocking). The channel buffers up to 16 bytes, and each byte goes to exactly one consumer."
+
+> **Dev:** "When should I use a signal vs a channel?"
+> **Domain expert:** "Use **signal** for broadcast: one producer, multiple consumers, all get the same value (e.g., sensor reading → display + logger + controller). Use **channel** for work distribution: one producer, one or more consumers, each value consumed by exactly one (e.g., ISR byte stream → processor task, command queue → worker). Signals are fire-and-forget; channels provide backpressure (push blocks if full)."
 
 > **Dev:** "How do I register a member function as a task?"
 > **Domain expert:** "Add a `using reactor_tasks = task_list<&MyClass::method1, &MyClass::method2>;` alias in your class, then call `register_instance<"TAG"_tag>(obj)` when creating the engine. The hero example is `examples/member_task/` — two mock sensor drivers plus a serial printer consumer, all wired through `register_instance` and `make_engine`."
@@ -132,6 +143,6 @@ _Avoid_: Exception, status code, result
 
 - **"Reactor" vs "Engine"**: We use **Engine** as the user-facing type name. "Reactor" is the pattern name, not a type.
 - **"Task" vs "Coroutine"**: A **Task** is a specific coroutine registered with the engine. Not all coroutines are tasks (e.g., helper coroutines).
-- **"Signal" vs "Channel"**: We use **Signal** for broadcast pub/sub. A **Channel** (future) would be queue-based (one listener gets the value).
+- **"Signal" vs "Channel"**: **Signal** is broadcast pub/sub (N listeners get every value). **Channel** (in `cgx::reactor::channel<T,Capacity>`) is point-to-point queue-based communication — one consumer takes each value. Both are standalone primitives with no engine dependency.
 - **"Idle worker"**: Initially discussed but rejected for barebones. All tasks are equal — each has a fixed slot. No dynamic task assignment.
 - **"Temporary task"**: Clarified as "task that fires and returns" — not a dynamically allocated task, but a registered task type that can be triggered, runs to completion, and becomes idle again.

@@ -28,6 +28,7 @@ std::vector<std::string> capture_logger::messages;
 struct debug_config {
     static constexpr std::size_t max_timers = 16;
     static constexpr std::size_t max_signal_listeners = 8;
+    static constexpr std::size_t reserved_pool_size = 8192;
     static constexpr log_level min_level = log_level::debug;
 };
 
@@ -35,6 +36,7 @@ struct debug_config {
 struct warn_config {
     static constexpr std::size_t max_timers = 16;
     static constexpr std::size_t max_signal_listeners = 8;
+    static constexpr std::size_t reserved_pool_size = 8192;
     static constexpr log_level min_level = log_level::warn;
 };
 

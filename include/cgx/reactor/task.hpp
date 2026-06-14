@@ -29,13 +29,13 @@ inline thread_local task_allocator current_task_allocator;
 struct task {
     struct promise_type {
         void* operator new(std::size_t sz) {
+            // Always capture frame size if requested (probe or pool region).
+            if (detail::current_task_allocator.size_out) {
+                *detail::current_task_allocator.size_out = sz;
+            }
             if (detail::current_task_allocator.buffer) {
                 if (sz > detail::current_task_allocator.size) {
-                    std::terminate();  // frame too large for slot
-                }
-                // Capture the actual frame size if requested.
-                if (detail::current_task_allocator.size_out) {
-                    *detail::current_task_allocator.size_out = sz;
+                    std::terminate();  // frame too large for allocated region
                 }
                 auto* buf = detail::current_task_allocator.buffer;
                 detail::current_task_allocator = {};  // consumed

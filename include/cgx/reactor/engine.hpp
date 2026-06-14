@@ -26,20 +26,6 @@ class engine;
 
 namespace detail {
 
-// -------------------------------------------------------------------------
-// Slot: owns coroutine-frame storage and tracks occupancy.
-// -------------------------------------------------------------------------
-
-template <std::size_t SlotSize>
-struct slot {
-    alignas(std::max_align_t) std::byte storage[SlotSize];
-    task current_task;
-    bool occupied = false;
-    bool suspended = true;  // true if task is suspended (waiting for timer/signal/etc)
-    void* self = nullptr;   // instance pointer for member-function tasks (null for free fns)
-    std::size_t frame_size = 0;  // actual coroutine frame size (set by probe)
-};
-
 // Build engine type from a type_list of descriptors
 template <typename Config, typename Clock, typename Logger, typename List>
 struct engine_from_desc_list;
@@ -103,6 +89,10 @@ static const char* fn_name() {
     return result.c_str();
 }
 
+/// Fallback frame size for tasks that could not be probed (e.g., tasks
+/// with parameters).  The probe only works for no-arg coroutines.
+static constexpr std::size_t default_frame_size = 1024;
+
 }  // namespace detail
 
 /// Compile-time task-registering coroutine engine.
@@ -126,6 +116,15 @@ class engine {
     std::array<const char*, num_tasks> tag_strings_{};
     std::array<char[tag_buf_size], num_tasks> auto_tag_bufs_{};
 
+    // Reserved pool — compile-time-sized byte array for coroutine frames.
+    alignas(std::max_align_t) std::array<std::byte, Config::reserved_pool_size> pool_{};
+
+    // Per-task metadata.
+    std::array<detail::task_meta, num_tasks> tasks_{};
+
+    // Set to true if the reserved pool is too small for all tasks.
+    bool pool_overflow_ = false;
+
     // Initialize tag strings: use user tag if non-empty, else auto-generate "TSK<n>"
     void init_tag_strings() {
         [this]<std::size_t... Is>(std::index_sequence<Is...>) {
@@ -148,28 +147,15 @@ class engine {
         }
     }
 
-    // Find the slot index for a given coroutine handle (runtime lookup)
+    // Find the task index for a given coroutine handle (runtime lookup)
     std::size_t find_slot_for_handle(std::coroutine_handle<> h) const noexcept {
         for (std::size_t i = 0; i < num_tasks; ++i) {
-            if (slots_[i].current_task.handle() == h) {
+            if (tasks_[i].handle == h) {
                 return i;
             }
         }
         return num_tasks; // not found
     }
-
-    // Per-task slot storage size.
-    // Override by defining Config::task_frame_size, otherwise 1024.
-    static constexpr std::size_t slot_storage_size() noexcept {
-        if constexpr (requires { Config::task_frame_size; }) {
-            return Config::task_frame_size;
-        } else {
-            return 1024;
-        }
-    }
-
-    using slot_t = detail::slot<slot_storage_size()>;
-    std::array<slot_t, num_tasks> slots_{};
 
     template <auto Fn>
     static constexpr std::size_t slot_index() {
@@ -179,11 +165,6 @@ class engine {
                       "Make sure the function pointer is included in a spec "
                       "passed to make_engine(...).");
         return idx;
-    }
-
-    template <typename F>
-    void for_each_slot(F&& f) {
-        for (auto& s : slots_) f(s);
     }
 
     /// Static callback for the thread-local timer registrar.
@@ -196,69 +177,80 @@ class engine {
     /// Static callback to mark a task as suspended on an external event.
     static void mark_suspended(void* ctx, std::coroutine_handle<> h) noexcept {
         auto* self = static_cast<engine*>(ctx);
-        for (auto& s : self->slots_) {
-            if (s.current_task.handle() && s.current_task.handle().address() == h.address()) {
-                s.suspended = true;
+        for (auto& t : self->tasks_) {
+            if (t.handle && t.handle.address() == h.address()) {
+                t.suspended = true;
                 break;
             }
         }
+    }
+
+    std::size_t total_pool_used() const noexcept {
+        if (num_tasks == 0) return 0;
+        auto& last = tasks_[num_tasks - 1];
+        return last.offset + last.size;
     }
 
     std::array<timer_entry, Config::max_timers> timers_{};
     std::size_t timer_count_ = 0;
 
     // -----------------------------------------------------------------------
-    // Internal: trigger the coroutine at a given slot index
+    // Internal: trigger the coroutine at a given task index
     // -----------------------------------------------------------------------
 
     template <std::size_t I, typename... Args>
     error trigger_slot(Args&&... args) {
-        auto& s = slots_[I];
+        if (pool_overflow_) {
+            log::detail::log_impl<Config, log_level::error, Logger, ClockType>(
+                "ERR", tag_strings_[I],
+                "reserved pool exhausted, trigger rejected");
+            return error::capacity_exceeded;
+        }
 
-        if (s.occupied) {
+        auto& meta = tasks_[I];
+
+        if (meta.occupied) {
             log::detail::log_impl<Config, log_level::warn, Logger, ClockType>(
                 "WRN", tag_strings_[I],
                 "already running, trigger rejected");
             return error::task_already_running;
         }
 
-        // Destroy any previous coroutine frame in the slot buffer.
-        if (s.current_task.handle()) {
-            s.current_task.handle().destroy();
+        // Destroy any previous coroutine frame in the pool region.
+        if (meta.handle) {
+            meta.handle.destroy();
         }
-        s.current_task = task{};
+        meta.handle = {};
 
-        // Point the thread-local allocator at the slot buffer and invoke the
+        // Point the thread-local allocator at the pool region and invoke the
         // coroutine. The promise_type::operator new will return this buffer.
-        // With initial_suspend = suspend_always, the coroutine suspends immediately,
-        // allowing us to store the handle before any user code runs.
-        detail::current_task_allocator = {s.storage, sizeof(s.storage)};
+        detail::current_task_allocator = {&pool_[meta.offset], meta.size, nullptr};
         detail::current_timer_registrar = {&timer_registrar_add, this};
         detail::current_external_suspension_registrar = {&mark_suspended, this};
-        s.suspended = false;  // Task is running
+        meta.suspended = false;  // Task is running
 
         // Dispatch: member function vs free function
         using desc = typename detail::type_at<I, Entries...>::type;
         using fn_type = decltype(desc::fn);
         if constexpr (std::is_member_function_pointer_v<fn_type>) {
             using Class = typename desc::class_type;
-            auto* obj = static_cast<Class*>(s.self);
-            s.current_task = task{(obj->*desc::fn)(std::forward<Args>(args)...)};
+            auto* obj = static_cast<Class*>(meta.self);
+            meta.handle = (obj->*desc::fn)(std::forward<Args>(args)...).handle();
         } else {
-            s.current_task = task{desc::fn(std::forward<Args>(args)...)};
+            meta.handle = desc::fn(std::forward<Args>(args)...).handle();
         }
 
-        // Now the handle is stored in the slot. Resume to start execution.
-        s.current_task.handle().resume();
+        // Now the handle is stored in the metadata. Resume to start execution.
+        meta.handle.resume();
 
         detail::current_external_suspension_registrar = {};
         detail::current_timer_registrar = {};
 
         // If the coroutine ran to completion immediately, the slot is free.
-        if (s.current_task.handle().done()) {
-            s.occupied = false;
+        if (meta.handle.done()) {
+            meta.occupied = false;
         } else {
-            s.occupied = true;
+            meta.occupied = true;
         }
 
         log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
@@ -268,7 +260,7 @@ class engine {
     }
 
     // -----------------------------------------------------------------------
-    // Internal: try to trigger a slot by instance + function pointer match
+    // Internal: try to trigger a task by instance + function pointer match
     // -----------------------------------------------------------------------
 
     // Accept any member function pointer type (const or non-const).
@@ -281,8 +273,8 @@ class engine {
         using registered_type = std::remove_cv_t<decltype(entry_t::fn)>;
 
         if constexpr (std::is_same_v<Fn, registered_type>) {
-            if (slots_[I].self == &obj && entry_t::fn == fn) {
-                if (slots_[I].occupied) {
+            if (tasks_[I].self == &obj && entry_t::fn == fn) {
+                if (tasks_[I].occupied) {
                     result = error::task_already_running;
                 } else {
                     result = trigger_slot<I>(std::forward<Args>(args)...);
@@ -299,11 +291,13 @@ public:
     /// Construct an engine with self pointers for member-function tasks.
     /// Called by make_engine().  For engines with zero tasks the array
     /// is empty and all self pointers are null-initialised.
-    engine(std::array<void*, num_tasks> self_ptrs) : slots_{} {
+    engine(std::array<void*, num_tasks> self_ptrs) : tasks_{} {
         for (std::size_t i = 0; i < num_tasks; ++i) {
-            slots_[i].self = self_ptrs[i];
+            tasks_[i].self = self_ptrs[i];
         }
         init_tag_strings();
+        // Probe each task directly in the reserved pool to capture the
+        // actual coroutine frame size and assign pool regions inline.
         probe_frame_sizes();
     }
 
@@ -311,11 +305,11 @@ public:
     engine& operator=(const engine&) = delete;
 
     ~engine() {
-        for_each_slot([](slot_t& s) {
-            if (s.current_task.handle()) {
-                s.current_task.handle().destroy();
+        for (auto& meta : tasks_) {
+            if (meta.handle) {
+                meta.handle.destroy();
             }
-        });
+        }
     }
 
     /// Register a timer entry (internal API for delay_ms).
@@ -367,7 +361,7 @@ public:
 
     /// Trigger a registered task coroutine by instance + method pointer (runtime lookup).
     ///
-    /// Searches all slots for one where the self pointer matches \p obj AND
+    /// Searches all tasks for one where the self pointer matches \p obj AND
     /// the registered function pointer matches \p fn.  If found and idle,
     /// the task is triggered.  If found and running, returns
     /// error::task_already_running.  If not found, returns
@@ -417,6 +411,7 @@ public:
     /// Returns the engine_report struct with summary stats.
     engine_report dump() const {
         auto r = report();
+        dump_pool_summary_log();
         [this]<std::size_t... Is>(std::index_sequence<Is...>) {
             ((dump_one_line_log<Is>()), ...);
         }(std::make_index_sequence<num_tasks>{});
@@ -428,6 +423,7 @@ public:
     template <typename Sink>
     engine_report dump(Sink&& sink) const {
         auto r = report();
+        dump_pool_summary_sink(sink);
         [this, &sink]<std::size_t... Is>(std::index_sequence<Is...>) {
             ((dump_one_line_sink<Is>(sink)), ...);
         }(std::make_index_sequence<num_tasks>{});
@@ -436,56 +432,127 @@ public:
 
 private:
     // -----------------------------------------------------------------------
-    // Frame-size probing: creates each coroutine at construction to capture
-    // the actual frame size, then immediately destroys it.
+    // Frame-size probing: creates each coroutine at construction directly in
+    // the reserved pool to capture the actual frame size, assigns the pool
+    // region inline, then destroys the probe coroutine.
+    //
+    // No-arg coroutines are created at the current pool offset; operator new
+    // captures the frame size via size_out and the frame is placed in the
+    // pool.  After probing, the region is free (destroyed) and its offset+size
+    // are committed for future real coroutine creation.
+    //
+    // Tasks with parameters cannot be probed (the compiler cannot deduce
+    // argument values at construction), so they receive a fallback size
+    // (detail::default_frame_size = 1024B).  Their region is reserved but
+    // unused until trigger.
+    //
+    // The pool is empty at construction, so probing directly in the pool
+    // avoids any heap allocation.  No heap is used during normal operation
+    // either — frames always live in the reserved pool.
     // -----------------------------------------------------------------------
 
     void probe_frame_sizes() {
-        [this]<std::size_t... Is>(std::index_sequence<Is...>) {
-            ((probe_frame_size<Is>()), ...);
+        std::size_t current_offset = 0;
+        [this, &current_offset]<std::size_t... Is>(std::index_sequence<Is...>) {
+            ((probe_frame_size<Is>(current_offset)), ...);
         }(std::make_index_sequence<num_tasks>{});
     }
 
     template <std::size_t I>
-    void probe_frame_size() {
-        auto& s = slots_[I];
+    void probe_frame_size(std::size_t& current_offset) {
         using entry_t = typename detail::type_at<I, Entries...>::type;
         using fn_type = std::remove_cv_t<decltype(entry_t::fn)>;
 
-        std::size_t actual_size = 0;
+        // Once overflow is detected, skip all remaining tasks.
+        if (pool_overflow_) {
+            tasks_[I].offset = 0;
+            tasks_[I].size = 0;
+            return;
+        }
+
+        // Align offset before assigning this task's region.
+        current_offset = (current_offset + alignof(std::max_align_t) - 1)
+                       & ~(alignof(std::max_align_t) - 1);
+        tasks_[I].offset = current_offset;
+
+        std::size_t remaining = Config::reserved_pool_size - current_offset;
+
+        // Minimum space needed to attempt a probe.  64 bytes is a safe lower
+        // bound for any no-arg coroutine frame (promise_type + implicit this).
+        // If less is available, skip probing and flag overflow below.
+        constexpr std::size_t min_probe_space = 64;
+        bool can_probe = (remaining >= min_probe_space);
         bool probed = false;
 
-        if constexpr (std::is_member_function_pointer_v<fn_type>) {
-            using Class = typename entry_t::class_type;
-            auto* obj = static_cast<Class*>(s.self);
+        if (can_probe) {
+            if constexpr (std::is_member_function_pointer_v<fn_type>) {
+                using Class = typename entry_t::class_type;
+                auto* obj = static_cast<Class*>(tasks_[I].self);
 
-            if constexpr (std::is_invocable_v<fn_type, Class*>) {
-                if (obj) {
-                    detail::current_task_allocator = {s.storage, sizeof(s.storage), &actual_size};
+                if constexpr (std::is_invocable_v<fn_type, Class*>) {
+                    if (obj) {
+                        // Create coroutine directly in the pool at current_offset.
+                        // The size_out pointer captures the actual frame size.
+                        detail::current_task_allocator = {&pool_[current_offset], remaining, &tasks_[I].size};
+                        {
+                            task t = (obj->*entry_t::fn)();
+                            t.handle().destroy();
+                        }
+                        detail::current_task_allocator = {};
+                        probed = true;
+                    }
+                }
+            } else {
+                if constexpr (std::is_invocable_v<fn_type>) {
+                    detail::current_task_allocator = {&pool_[current_offset], remaining, &tasks_[I].size};
                     {
-                        task t = (obj->*entry_t::fn)();
+                        task t = entry_t::fn();
                         t.handle().destroy();
                     }
                     detail::current_task_allocator = {};
-                    s.frame_size = actual_size;
                     probed = true;
                 }
-            }
-        } else {
-            if constexpr (std::is_invocable_v<fn_type>) {
-                detail::current_task_allocator = {s.storage, sizeof(s.storage), &actual_size};
-                {
-                    task t = entry_t::fn();
-                    t.handle().destroy();
-                }
-                detail::current_task_allocator = {};
-                s.frame_size = actual_size;
-                probed = true;
             }
         }
 
         if (!probed) {
-            s.frame_size = slot_storage_size();
+            tasks_[I].size = detail::default_frame_size;
+        }
+
+        // Advance past this task's region.
+        current_offset += tasks_[I].size;
+        if (current_offset > Config::reserved_pool_size) {
+            pool_overflow_ = true;
+            tasks_[I].offset = 0;
+            tasks_[I].size = 0;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Dump helpers
+    // -----------------------------------------------------------------------
+
+    void dump_pool_summary_log() const {
+        std::size_t used = total_pool_used();
+        double pct = (static_cast<double>(used) / Config::reserved_pool_size) * 100.0;
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "Reserved pool: %zuB / %zuB used (%.1f%%)",
+                      used, static_cast<std::size_t>(Config::reserved_pool_size), pct);
+        log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
+            "INF", "", "%s", line);
+    }
+
+    template <typename Sink>
+    void dump_pool_summary_sink(Sink& sink) const {
+        std::size_t used = total_pool_used();
+        double pct = (static_cast<double>(used) / Config::reserved_pool_size) * 100.0;
+        char line[256];
+        int n = std::snprintf(line, sizeof(line),
+                              "Reserved pool: %zuB / %zuB used (%.1f%%)",
+                              used, static_cast<std::size_t>(Config::reserved_pool_size), pct);
+        if (n > 0) {
+            sink(std::string_view(line, static_cast<std::size_t>(n)));
         }
     }
 
@@ -496,9 +563,9 @@ private:
         const char* fn_name = detail::fn_name<entry_fn>();
         char line[256];
         std::snprintf(line, sizeof(line),
-                      "[%zu] %s  %s  reserved  frame=~%zuB",
+                      "[%zu] %s  %s  offset=%zu  size=%zuB",
                       I, tag_strings_[I] + detail::log_tag_prefix_len,
-                      fn_name, slots_[I].frame_size);
+                      fn_name, tasks_[I].offset, tasks_[I].size);
         log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
             "INF", tag_strings_[I], "%s", line);
     }
@@ -510,9 +577,9 @@ private:
         const char* fn_name = detail::fn_name<entry_fn>();
         char line[256];
         int n = std::snprintf(line, sizeof(line),
-                              "[%zu] %s  %s  reserved  frame=~%zuB",
+                              "[%zu] %s  %s  offset=%zu  size=%zuB",
                               I, tag_strings_[I] + detail::log_tag_prefix_len,
-                              fn_name, slots_[I].frame_size);
+                              fn_name, tasks_[I].offset, tasks_[I].size);
         if (n > 0) {
             sink(std::string_view(line, static_cast<std::size_t>(n)));
         }
@@ -527,34 +594,34 @@ public:
 
         // Clean up completed tasks (e.g., tasks that completed via signal resume)
         for (std::size_t i = 0; i < num_tasks; ++i) {
-            auto& s = slots_[i];
-            if (s.occupied && s.current_task.handle() &&
-                s.current_task.handle().done()) {
+            auto& meta = tasks_[i];
+            if (meta.occupied && meta.handle &&
+                meta.handle.done()) {
                 log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
                     "INF", tag_strings_[i], "completed");
-                s.occupied = false;
+                meta.occupied = false;
             }
         }
 
         // (a) Resume directly-runnable tasks — occupied, not done,
         //     not suspended on external event, and NOT waiting on a pending timer.
         for (std::size_t i = 0; i < num_tasks; ++i) {
-            auto& s = slots_[i];
-            if (s.occupied && s.current_task.handle() &&
-                !s.current_task.handle().done() && !s.suspended) {
+            auto& meta = tasks_[i];
+            if (meta.occupied && meta.handle &&
+                !meta.handle.done() && !meta.suspended) {
                 bool has_timer = false;
                 for (std::size_t j = 0; j < timer_count_; ++j) {
-                    if (timers_[j].handle == s.current_task.handle()) {
+                    if (timers_[j].handle == meta.handle) {
                         has_timer = true;
                         break;
                     }
                 }
                 if (!has_timer) {
-                    s.current_task.handle().resume();
-                    if (s.current_task.handle().done()) {
+                    meta.handle.resume();
+                    if (meta.handle.done()) {
                         log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
                             "INF", tag_strings_[i], "completed");
-                        s.occupied = false;
+                        meta.occupied = false;
                     }
                 }
             }
@@ -582,19 +649,19 @@ public:
         // (c) Resume all expired timers
         for (std::size_t i = 0; i < expired_count; ++i) {
             auto h = expired[i];
-            std::size_t slot_idx = find_slot_for_handle(h);
-            if (slot_idx < num_tasks) {
+            std::size_t task_idx = find_slot_for_handle(h);
+            if (task_idx < num_tasks) {
                 log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
-                    "INF", tag_strings_[slot_idx],
+                    "INF", tag_strings_[task_idx],
                     "timer expired, resuming");
-                slots_[slot_idx].suspended = false;
+                tasks_[task_idx].suspended = false;
             }
             h.resume();
             if (h.done()) {
-                if (slot_idx < num_tasks) {
+                if (task_idx < num_tasks) {
                     log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
-                        "INF", tag_strings_[slot_idx], "completed");
-                    slots_[slot_idx].occupied = false;
+                        "INF", tag_strings_[task_idx], "completed");
+                    tasks_[task_idx].occupied = false;
                 }
             }
         }
@@ -610,6 +677,13 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Pool status
+    // -----------------------------------------------------------------------
+
+    /// Returns true if the reserved pool is too small to hold all tasks.
+    bool pool_exhausted() const noexcept { return pool_overflow_; }
 };
 
 // ---------------------------------------------------------------------------

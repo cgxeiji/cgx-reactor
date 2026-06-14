@@ -6,10 +6,9 @@ using namespace std::chrono_literals;
 
 // Configuration with small limits to trigger errors
 struct small_config {
-    static constexpr std::size_t max_tasks = 7;            // 7 tasks total
     static constexpr std::size_t max_timers = 2;           // Only 2 timers allowed
     static constexpr std::size_t max_signal_listeners = 2; // Only 2 listeners allowed
-    static constexpr std::size_t task_frame_size = 64;
+    static constexpr std::size_t reserved_pool_size = 8192;
     static constexpr log_level min_level = log_level::info;
 };
 

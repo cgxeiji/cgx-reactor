@@ -302,17 +302,21 @@ TEST(InstanceTriggerTest, DumpWithCustomSink) {
         sink_lines.push_back(std::string(line));
     });
 
-    ASSERT_GE(sink_lines.size(), 3u);
+    // Pool summary line + 3 per-task lines
+    ASSERT_GE(sink_lines.size(), 4u);
     EXPECT_EQ(r.task_count, 3u);
 
-    // Each line should start with [0], [1], [2]
-    EXPECT_TRUE(sink_lines[0].starts_with("[0]"));
-    EXPECT_TRUE(sink_lines[1].starts_with("[1]"));
-    EXPECT_TRUE(sink_lines[2].starts_with("[2]"));
+    // First line is the pool summary
+    EXPECT_NE(sink_lines[0].find("Reserved pool:"), std::string::npos);
 
-    // Should contain "reserved" and "frame="
-    EXPECT_NE(sink_lines[0].find("reserved"), std::string::npos);
-    EXPECT_NE(sink_lines[0].find("frame=~"), std::string::npos);
+    // Per-task lines should start with [0], [1], [2]
+    EXPECT_TRUE(sink_lines[1].starts_with("[0]"));
+    EXPECT_TRUE(sink_lines[2].starts_with("[1]"));
+    EXPECT_TRUE(sink_lines[3].starts_with("[2]"));
+
+    // Should contain "offset=" and "size="
+    EXPECT_NE(sink_lines[1].find("offset="), std::string::npos);
+    EXPECT_NE(sink_lines[1].find("size="), std::string::npos);
 }
 
 TEST(InstanceTriggerTest, DumpWithNoLoggerReturnsStats) {
@@ -393,20 +397,143 @@ TEST(InstanceTriggerTest, DumpShowsProbedFrameSize) {
 
     eng.dump();
 
-    // Each dump line should contain "frame=~" followed by a number.
+    // Each per-task dump line should contain "size=" followed by a number.
     // The frame size should be non-zero (probed at construction).
-    ASSERT_GE(capture_logger::lines.size(), 3u);
-    for (const auto& line : capture_logger::lines) {
-        auto pos = line.find("frame=~");
-        ASSERT_NE(pos, std::string::npos) << "line missing frame=~: " << line;
-        pos += 7;  // past "frame=~"
+    // Skip the first line (pool summary), check the remaining per-task lines.
+    ASSERT_GE(capture_logger::lines.size(), 4u);  // summary + 3 tasks
+    for (std::size_t i = 1; i < capture_logger::lines.size(); ++i) {
+        const auto& line = capture_logger::lines[i];
+        auto pos = line.find("size=");
+        ASSERT_NE(pos, std::string::npos) << "line missing size=: " << line;
+        pos += 5;  // past "size="
         auto end = line.find('B', pos);
         ASSERT_NE(end, std::string::npos);
         auto size_str = line.substr(pos, end - pos);
         auto size = std::stoul(size_str);
         EXPECT_GT(size, 0u) << "frame size should be non-zero: " << line;
-        EXPECT_LE(size, 1024u) << "frame size should not exceed slot size: " << line;
+        EXPECT_LE(size, 1024u) << "frame size should not exceed default: " << line;
     }
+}
+
+// -----------------------------------------------------------------------
+// Reserved pool tests
+// -----------------------------------------------------------------------
+
+TEST(InstanceTriggerTest, PoolSizingShowsCorrectUsage) {
+    std::vector<std::string> sink_lines;
+    simple_driver drv;
+
+    auto eng = make_engine<default_config, test::mock_clock>(
+        register_instance(drv));  // one task: set_val(int)
+
+    eng.dump([&sink_lines](std::string_view line) {
+        sink_lines.push_back(std::string(line));
+    });
+
+    // First line is pool summary
+    ASSERT_GE(sink_lines.size(), 2u);
+    EXPECT_NE(sink_lines[0].find("Reserved pool:"), std::string::npos);
+    EXPECT_NE(sink_lines[0].find("/ 8192B used"), std::string::npos);
+
+    // Per-task line should have correct size (set_val has params, gets fallback)
+    EXPECT_NE(sink_lines[1].find("size=1024B"), std::string::npos);
+}
+
+TEST(InstanceTriggerTest, FrameProbingCapturesNoArgTasks) {
+    // test_driver::init and test_driver::loop are no-arg and should be probed.
+    // test_driver::fire_once has a parameter and gets the fallback size.
+    std::vector<std::string> sink_lines;
+    test_driver drv;
+
+    auto eng = make_engine<default_config, test::mock_clock>(
+        register_instance(drv));
+
+    eng.dump([&sink_lines](std::string_view line) {
+        sink_lines.push_back(std::string(line));
+    });
+
+    // 1 pool summary + 3 per-task lines
+    ASSERT_GE(sink_lines.size(), 4u);
+
+    // init (index 0): no-arg member, should be probed (small, <= 64B)
+    EXPECT_NE(sink_lines[1].find("test_driver::init"), std::string::npos);
+    EXPECT_TRUE(sink_lines[1].find("size=") != std::string::npos)
+        << "init missing size=: " << sink_lines[1];
+    {
+        // Extract size value and verify it's small (probed, not fallback)
+        auto pos = sink_lines[1].find("size=") + 5;
+        auto end = sink_lines[1].find('B', pos);
+        auto sz = std::stoul(sink_lines[1].substr(pos, end - pos));
+        EXPECT_LT(sz, 256u) << "init probed size should be small: " << sink_lines[1];
+        EXPECT_GT(sz, 0u) << "init probed size should be non-zero: " << sink_lines[1];
+    }
+
+    // loop (index 1): no-arg member, should be probed (small, <= 64B)
+    EXPECT_NE(sink_lines[2].find("test_driver::loop"), std::string::npos);
+    {
+        auto pos = sink_lines[2].find("size=") + 5;
+        auto end = sink_lines[2].find('B', pos);
+        auto sz = std::stoul(sink_lines[2].substr(pos, end - pos));
+        EXPECT_LT(sz, 256u) << "loop probed size should be small: " << sink_lines[2];
+        EXPECT_GT(sz, 0u) << "loop probed size should be non-zero: " << sink_lines[2];
+    }
+
+    // fire_once (index 2): takes int param, NOT probed, gets fallback 1024B
+    EXPECT_NE(sink_lines[3].find("test_driver::fire_once"), std::string::npos);
+    EXPECT_NE(sink_lines[3].find("size=1024B"), std::string::npos)
+        << "fire_once should get fallback: " << sink_lines[3];
+}
+
+TEST(InstanceTriggerTest, PoolAlignment) {
+    std::vector<std::string> sink_lines;
+    test_driver drv;
+
+    auto eng = make_engine<default_config, test::mock_clock>(
+        register_instance(drv));
+
+    eng.dump([&sink_lines](std::string_view line) {
+        sink_lines.push_back(std::string(line));
+    });
+
+    // Per-task lines (skip pool summary at index 0)
+    ASSERT_GE(sink_lines.size(), 4u);
+    for (std::size_t i = 1; i < sink_lines.size(); ++i) {
+        const auto& line = sink_lines[i];
+        auto pos = line.find("offset=");
+        ASSERT_NE(pos, std::string::npos) << "line missing offset=: " << line;
+        pos += 7;  // past "offset="
+        auto end = line.find("  ", pos);
+        ASSERT_NE(end, std::string::npos);
+        auto offset_str = line.substr(pos, end - pos);
+        auto offset = std::stoul(offset_str);
+        EXPECT_EQ(offset % alignof(std::max_align_t), 0u)
+            << "offset should be aligned to max_align_t: " << line;
+    }
+}
+
+// Config with a tiny pool to test overflow handling
+struct tiny_pool : default_config {
+    static constexpr std::size_t reserved_pool_size = 32;
+};
+
+TEST(InstanceTriggerTest, PoolOversizeReturnsError) {
+    test_driver drv;
+    auto eng = make_engine<tiny_pool, test::mock_clock>(
+        register_instance(drv));
+
+    // Pool is too small to hold even one task's frame
+    EXPECT_TRUE(eng.pool_exhausted());
+
+    // All triggers should return capacity_exceeded
+    auto ec = eng.template trigger<&test_driver::init>();
+    ASSERT_EQ(ec, error::capacity_exceeded);
+
+    ec = eng.template trigger<&test_driver::loop>();
+    ASSERT_EQ(ec, error::capacity_exceeded);
+
+    // Instance-based trigger should also fail
+    ec = eng.trigger(drv, &test_driver::init);
+    ASSERT_EQ(ec, error::capacity_exceeded);
 }
 
 }  // anonymous namespace

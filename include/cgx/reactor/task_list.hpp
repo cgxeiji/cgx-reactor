@@ -1,5 +1,6 @@
 #pragma once
 
+#include <coroutine>
 #include <cstddef>
 #include <type_traits>
 #include <utility>
@@ -105,6 +106,25 @@ struct unwrap_task_list_helper<task_list<MemFns...>> {
 
 // ---------------------------------------------------------------------------
 // register_instance — read Class::reactor_tasks, return bound<...>
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// task_meta: per-task metadata for the reserved-pool engine.
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+struct task_meta {
+    std::coroutine_handle<> handle;
+    bool occupied = false;
+    bool suspended = true;
+    void* self = nullptr;
+    std::size_t offset = 0;
+    std::size_t size = 0;
+};
+
+} // namespace detail
+
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------

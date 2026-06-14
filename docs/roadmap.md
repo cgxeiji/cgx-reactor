@@ -42,6 +42,16 @@ All barebones items are complete (this milestone was reached before the refactor
 - **~~Test coverage~~** — 13 tests in `test_logger.cpp`: custom capture, timestamp format, level filtering, no_logger suppression, tag format, full timer flow, already-running, capacity exceeded.
 - **~~Const channel pop~~** — `pop()` is now const-qualified, mirroring `signal::listen()`. A `const channel&` can receive (Go's `<-chan T` pattern). Internal buffer/wait-queue members are `mutable`. `push()`/`try_push()`/`close()` remain non-const.
 
+## 2026-06-14 — Instance-Based Trigger ✓
+
+- **~~Instance-based dispatch~~** — New `eng.trigger(obj, &Class::method, args...)` overload searches slots by self pointer AND function pointer. Supports multiple instances of the same class. Legacy `eng.trigger<&Class::method>()` still works (triggers first registered instance).
+- **~~Optional tags~~** — Tags are no longer required for registration. `register_instance(obj)` auto-generates index-based tags (`TSK0`, `TSK1`, ...) for logging. Tags are used for logging only, not dispatch.
+- **~~Engine dump~~** — `eng.dump()` returns `engine_report` struct with task counts. Supports logger output and custom callable sink. Frame sizes probed at construction.
+- **~~Const member function support~~** — `trigger()` works with both const and non-const member functions.
+- **~~`task_not_registered` error~~** — New error code returned when instance+method not found in engine.
+- **~~Test coverage~~** — 14 new tests: instance dispatch (single/multi instance, not-registered, already-running), free function compatibility, dump (logger, sink, stats, auto-tags), const member function.
+- **~~Instance trigger example~~** — `examples/instance_trigger/` showcases two instances of the same sensor class triggered independently by instance reference.
+
 ## 2026-06-14 — Drift-Free Timers ✓
 
 - **~~`delay_until(time_point)`~~** — absolute-time awaitable for drift-free periodic tasks. Accepts a `Clock::time_point` directly; caller manages epoch. Usage: `co_await delay_until<steady_clock>(next); next += period;`
@@ -52,5 +62,6 @@ All barebones items are complete (this milestone was reached before the refactor
 ## Upcoming
 
 - **Task lifecycle (`cancel()`, `join()`)** — explicit management of running tasks
+- **Scratchpad pool** — shared memory for one-shot tasks (`cr::scratch<&T::method>`)
 - **RP2040 clock implementation** — reference implementation for Pico SDK
 - **Custom awaitable examples** — `next_byte` for UART, `wait_for_pin` for GPIO

@@ -107,7 +107,18 @@ struct unwrap_task_list_helper<task_list<MemFns...>> {
 // register_instance — read Class::reactor_tasks, return bound<...>
 // ---------------------------------------------------------------------------
 
-template <auto Tag = tag<'\0', '\0', '\0', '\0'>{}, typename Class>
+// ---------------------------------------------------------------------------
+// Engine report — diagnostics from engine::dump()
+// ---------------------------------------------------------------------------
+
+struct engine_report {
+    std::size_t task_count;
+    std::size_t reserved_count;
+    std::size_t scratchpad_count;
+    std::size_t scratchpad_size;
+};
+
+template <auto Tag = tag<>{}, typename Class>
 auto register_instance(Class& obj) {
     return typename detail::unwrap_task_list_helper<
         typename Class::reactor_tasks
@@ -118,7 +129,14 @@ auto register_instance(Class& obj) {
 // register_task — wrap a free function as a free_spec
 // ---------------------------------------------------------------------------
 
-template <auto Tag = tag<'\0', '\0', '\0', '\0'>{}, auto Fn>
+// Single-argument overload: no explicit tag (auto-generate)
+template <auto Fn>
+constexpr free_spec<tag<>{}, Fn> register_task() noexcept {
+    return {};
+}
+
+// Two-argument overload: explicit tag + function pointer
+template <auto Tag, auto Fn>
 constexpr free_spec<Tag, Fn> register_task() noexcept {
     return {};
 }

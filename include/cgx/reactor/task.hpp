@@ -11,10 +11,13 @@ namespace detail {
 
 // Thread-local allocator used by the engine to pass the slot buffer
 // to the coroutine's promise_type::operator new.
-inline thread_local struct {
+// If size_out is non-null, operator new writes the actual frame size to it.
+struct task_allocator {
     void* buffer = nullptr;
     std::size_t size = 0;
-} current_task_allocator;
+    std::size_t* size_out = nullptr;
+};
+inline thread_local task_allocator current_task_allocator;
 
 } // namespace detail
 
@@ -29,6 +32,10 @@ struct task {
             if (detail::current_task_allocator.buffer) {
                 if (sz > detail::current_task_allocator.size) {
                     std::terminate();  // frame too large for slot
+                }
+                // Capture the actual frame size if requested.
+                if (detail::current_task_allocator.size_out) {
+                    *detail::current_task_allocator.size_out = sz;
                 }
                 auto* buf = detail::current_task_allocator.buffer;
                 detail::current_task_allocator = {};  // consumed

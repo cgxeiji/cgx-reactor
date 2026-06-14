@@ -39,7 +39,11 @@ Awaitable that suspends until the next grid-aligned tick relative to the clock's
 _Avoid_: delay_periodic, delay_aligned
 
 **Tag**:
-A compile-time character sequence (typically 4 chars) used to identify a task slot for debugging and error messages. Constructed via the `"DISP"_tag` user-defined literal (C++20 template UDL, P1040R6) or the escape hatch `make_tag<'D','I','S','P'>()`. The UDL requires a `using` declaration at the call site (`using cgx::reactor::operator""_tag;`).
+A compile-time character sequence (typically 4 chars) used to identify a task slot for logging and error messages. Tags are optional — if not provided, the engine auto-generates index-based tags (`TSK0`, `TSK1`, ...) at construction.
+
+Tags are constructed via the `"DISP"_tag` user-defined literal (C++20 template UDL, P1040R6) or the escape hatch `make_tag<'D','I','S','P'>()`. The UDL requires a `using` declaration at the call site (`using cgx::reactor::operator""_tag;`).
+
+Tags are used for logging only — dispatch is by instance reference or function pointer.
 _Avoid_: Label, id, name
 
 **Reactor Tasks**:
@@ -74,8 +78,11 @@ _Avoid_: Settings, options, parameters
 ### Engine Operations
 
 **Trigger**:
-Transitions a task from Idle → Running. Calls the task coroutine function with provided arguments. For member-function tasks, the instance pointer is already stored in the slot (from `register_instance`), so the call site does NOT pass the object.
-Returns `error::task_already_running` if the task is already active.
+Transitions a task from Idle → Running. Two dispatch mechanisms:
+- **Instance-based** (preferred): `eng.trigger(obj, &Class::method, args...)` — searches slots by self pointer AND function pointer. Supports multiple instances of the same class.
+- **Function pointer** (legacy): `eng.trigger<&fn>(args...)` — compile-time slot lookup. For member functions, triggers the FIRST registered instance.
+
+Returns `error::task_already_running` if the task is already active, or `error::task_not_registered` if the instance+method is not found.
 _Avoid_: Start, launch, invoke
 
 **Tick**:
@@ -93,10 +100,17 @@ _Avoid_: Bind, attach, add
 **Register Instance**:
 Helper that reads a class's `reactor_tasks` alias and returns a `bound<Class, Tag, MemFns...>` for use with `make_engine`.
 ```cpp
-register_instance<"TAG"_tag>(my_obj)
+register_instance<"TAG"_tag>(my_obj)  // explicit tag
+register_instance(my_obj)              // auto-generated tag
 ```
 
-**Limitation (planned fix)**: when multiple instances of the same class are registered, the engine allocates one slot per member function per instance, but the trigger API (`eng.trigger<&Class::method>()`) always resumes the **first** instance's slot. The tag is currently used for debugging/error messages only, not for dispatch. Workarounds: use distinct method names per instance, or wait for the per-tag dispatch feature.
+Tags are optional — if not provided, the engine auto-generates index-based tags (`TSK0`, `TSK1`, ...) for logging. Tags are used for logging only, not for dispatch.
+
+Multiple instances of the same class are supported. Use instance-based trigger to disambiguate:
+```cpp
+eng.trigger(obj_a, &Class::method);  // triggers obj_a's task
+eng.trigger(obj_b, &Class::method);  // triggers obj_b's task
+```
 _Avoid_: Bind object, attach instance
 
 **Make Engine**:
@@ -127,7 +141,7 @@ _Avoid_: Severity, log priority
 ### Error Handling
 
 **Error**:
-Enum class representing failure conditions (e.g., `task_already_running`, `capacity_exceeded`, `closed`). Functions return `error` or `std::optional<T>` + `error`. No exceptions.
+Enum class representing failure conditions (e.g., `task_already_running`, `task_not_registered`, `capacity_exceeded`, `closed`). Functions return `error` or `std::optional<T>` + `error`. No exceptions.
 _Avoid_: Exception, status code, result
 
 ## Relationships
@@ -161,7 +175,7 @@ _Avoid_: Exception, status code, result
 > **Domain expert:** "You call `tick()` in a loop. Tick processes expired timers and resumes those tasks. If tasks suspend on signals, they resume directly when `fire()` is called — not via tick. The event loop just keeps ticking."
 
 > **Dev:** "Can I have multiple instances of the same task type?"
-> **Domain expert:** "No — each registered function pointer is a singleton with a fixed slot. If you need multiple instances, use different classes or register each instance with a different tag (each tag creates a separate slot for each member function)."
+> **Domain expert:** "Yes — register each instance with `register_instance(obj)` (tags are optional, auto-generated for logging). Then trigger by instance reference: `eng.trigger(obj_a, &Class::method)` and `eng.trigger(obj_b, &Class::method)`. Each instance gets its own slot. See `examples/instance_trigger/` for a working demo."
 
 > **Dev:** "How does a task wait for a UART byte?"
 > **Domain expert:** "You have two options depending on the pattern. For broadcast (multiple consumers want the byte): create a `signal<uint8_t> uart_byte`. The task does `auto b = co_await uart_byte.listen()`. When the UART ISR receives a byte, it calls `uart_byte.fire(b)`, which resumes all listeners. For point-to-point (one consumer processes the byte): create a `channel<uint8_t, 16> uart_rx`. The task does `auto b = co_await uart_rx.pop()`. The ISR calls `uart_rx.try_push(b)` (non-blocking). The channel buffers up to 16 bytes, and each byte goes to exactly one consumer."
@@ -170,7 +184,7 @@ _Avoid_: Exception, status code, result
 > **Domain expert:** "Use **signal** for broadcast: one producer, multiple consumers, all get the same value (e.g., sensor reading → display + logger + controller). Use **channel** for work distribution: one producer, one or more consumers, each value consumed by exactly one (e.g., ISR byte stream → processor task, command queue → worker). Signals are fire-and-forget; channels provide backpressure (push blocks if full)."
 
 > **Dev:** "How do I register a member function as a task?"
-> **Domain expert:** "Add a `using reactor_tasks = task_list<&MyClass::method1, &MyClass::method2>;` alias in your class, then call `register_instance<"TAG"_tag>(obj)` when creating the engine. The hero example is `examples/member_task/` — two mock sensor drivers plus a serial printer consumer, all wired through `register_instance` and `make_engine`."
+> **Domain expert:** "Add a `using reactor_tasks = task_list<&MyClass::method1, &MyClass::method2>;` alias in your class, then call `register_instance(obj)` when creating the engine. Tags are optional — if not provided, the engine auto-generates index-based tags for logging. See `examples/member_task/` for the full pattern."
 
 > **Dev:** "Is the timer queue part of the engine or a signal?"
 > **Domain expert:** "The timer queue is managed by the engine internally. Signals are standalone — they resume coroutines directly. They're separate mechanisms that serve different purposes."

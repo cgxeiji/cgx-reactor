@@ -282,14 +282,20 @@ engine stores fn as NTTP for compile-time dispatch
 ```
 Driver class:  using reactor_tasks = task_list<&Driver::method1, &Driver::method2>;
     ↓
-User code:  register_instance<"TAG"_tag>(obj)
+User code:  register_instance<"TAG"_tag>(obj)  — or register_instance(obj) for auto-tag
     ↓
 register_instance reads Class::reactor_tasks and returns bound<Class, Tag, MemFns...>
     ↓
 make_engine unfolds the bound into one task_descriptor per member function
     ↓
 engine stores each fn as NTTP, plus the self pointer in the slot
+    ↓
+At construction, engine probes each task to capture actual coroutine frame size
 ```
+
+**Trigger dispatch:**
+- `eng.trigger(obj, &Class::method)` — instance-based (preferred): searches slots by self pointer AND function pointer
+- `eng.trigger<&Class::method>()` — function pointer (legacy): triggers the FIRST registered instance
 
 ## Memory Model
 
@@ -318,6 +324,7 @@ This pattern allows awaitables to interact with the engine without explicit para
 All operations return `error` codes:
 - `error::ok` — success
 - `error::task_already_running` — tried to trigger a running task
+- `error::task_not_registered` — instance+method not found in engine (instance-based trigger only)
 - `error::capacity_exceeded` — timer queue, listener queue, or channel full
 - `error::listener_limit_exceeded` — too many concurrent listeners
 - `error::closed` — channel was closed by the producer
@@ -363,22 +370,49 @@ This allows:
 - **No priority** — all tasks are treated equally
 - **No dynamic task registration** — tasks must be known at compile time
 - **No cross-engine signals** — signals are local to a single engine instance
+- **No cancellation** — once triggered, a task runs until it suspends or completes
+- **Scratchpad pool** — not yet implemented (planned: shared memory for one-shot tasks)
 
 ## Future Directions
 
 See [roadmap.md](roadmap.md) for planned features:
-- `delay_until()` for drift-free periodic tasks
 - Task lifecycle management (`cancel()`, `join()`)
+- Scratchpad pool for one-shot tasks (`cr::scratch<&T::method>`)
 - RP2040 clock implementation
+
+## Engine Diagnostics
+
+The engine provides a `dump()` method for inspecting task layout:
+
+```cpp
+// Via logger
+eng.dump();
+
+// Via custom sink
+eng.dump([](std::string_view line) { printf("%s\n", line.data()); });
+
+// Returns stats
+auto report = eng.dump();
+// report.task_count, report.reserved_count, report.scratchpad_count, report.scratchpad_size
+```
+
+Output format:
+```
+[0] TSK0  driver::init   reserved  frame=~64B
+[1] TSK1  driver::loop   reserved  frame=~1024B
+```
+
+Frame sizes are probed at engine construction by creating and destroying each coroutine once.
 
 ## Examples
 
-Five runnable examples live under `examples/`:
+Six runnable examples live under `examples/`:
 
 | Directory | What it shows |
 |-----------|---------------|
 | `examples/basic/` | Free-function tasks wired through `register_task` + `make_engine`. Producer/consumer over a signal. The simplest end-to-end demo. |
 | `examples/error_handling/` | Exercises every error code (`task_already_running`, `capacity_exceeded`, `listener_limit_exceeded`) with a deliberately small `Config` so the limits are easy to hit. |
-| `examples/member_task/` | The hero example for the member-function API. Three classes — two mock sensors and a serial printer consumer — all using `reactor_tasks` aliases and `register_instance`. Run with `make example_member_task`; produces interleaved temperature/pressure readings over ~3 seconds. |
-| `examples/channel/` | Demonstrates point-to-point communication with `channel<T, Capacity>`. Shows ISR-to-task data flow with a UART receiver pushing bytes into a channel, and a processor task consuming them. Illustrates blocking `pop()` for task contexts and non-blocking `try_push()` for ISR contexts. Run with `make example_channel`. |
-| `examples/timer/` | Side-by-side comparison of all three timer primitives. Runs three concurrent tasks — `delay_ms` (drifty), `delay_until` (precise), `delay_quantized` (grid-aligned) — and prints wall-clock timestamps so drift is visually obvious. Run with `make example_timer`. |
+| `examples/member_task/` | Member-function API with `reactor_tasks` aliases and `register_instance`. Three classes — two mock sensors and a serial printer consumer. |
+| `examples/instance_trigger/` | Instance-based trigger dispatch. Two instances of the same sensor class, triggered independently by instance reference. Shows `dump()` with accurate frame sizes. |
+| `examples/channel/` | Point-to-point communication with `channel<T, Capacity>`. ISR-to-task data flow with blocking `pop()` and non-blocking `try_push()`. |
+| `examples/timer/` | Side-by-side comparison of all three timer primitives — `delay_ms` (drifty), `delay_until` (precise), `delay_quantized` (grid-aligned). |

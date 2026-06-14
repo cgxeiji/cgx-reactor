@@ -1,6 +1,7 @@
 add_subdirectory(basic)
 add_subdirectory(error_handling)
 add_subdirectory(member_task)
+add_subdirectory(instance_trigger)
 add_subdirectory(channel)
 add_subdirectory(logger)
 add_subdirectory(timer)

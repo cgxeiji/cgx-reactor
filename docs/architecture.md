@@ -301,14 +301,43 @@ At construction, engine probes each task to capture actual coroutine frame size
 
 All memory is statically allocated:
 
-1. **Task slots** — fixed-size array in engine, one per registered task
-2. **Coroutine frames** — placement-new allocated into slot storage
-3. **Timer queue** — fixed-size array (configurable via `Config::max_timers`)
-4. **Signal listeners** — fixed-size array per signal (configurable via `Config::max_signal_listeners`)
-5. **Channel buffers** — fixed-size ring buffer per channel (compile-time `Capacity` template parameter)
-6. **Channel wait queues** — fixed-size arrays per channel (bounded by `Capacity`)
+1. **Reserved pool** — compile-time-sized byte array for permanent task frames (auto-sized from probed frame sizes)
+2. **Scratchpad pool** — compile-time-sized byte array for one-shot task frames (user-defined `Config::scratchpad_pool_size`)
+3. **Coroutine frames** — placement-new allocated into pool storage (reserved or scratchpad)
+4. **Timer queue** — fixed-size array (configurable via `Config::max_timers`)
+5. **Signal listeners** — fixed-size array per signal (configurable via `Config::max_signal_listeners`)
+6. **Channel buffers** — fixed-size ring buffer per channel (compile-time `Capacity` template parameter)
+7. **Channel wait queues** — fixed-size arrays per channel (bounded by `Capacity`)
+8. **Scratchpad waiters** — fixed-size array for blocked scratchpad triggers (bounded by 8)
 
 **No dynamic allocation occurs at runtime.**
+
+### Reserved vs Scratchpad Tasks
+
+| | Reserved | Scratchpad |
+|---|---|---|
+| **Lifetime** | Permanent slot, lives until engine destroyed | Allocated on trigger, freed on completion |
+| **Use case** | `loop()`, event loops, long-running | `init()`, one-shot commands, fire-and-forget |
+| **Memory** | Reserved pool (auto-sized) | Scratchpad pool (user-defined) |
+| **Marking** | Default in `task_list` | `cr::scratch<&T::method>` in `task_list` |
+| **Trigger** | `trigger()` or `try_trigger()` | `trigger()` blocks if pool full, `try_trigger()` returns error |
+| **FIFO ordering** | N/A | Yes — tasks wait in line even if space available |
+
+### Scratchpad FIFO Ordering
+
+When the scratchpad pool is full, new triggers join a FIFO waiter list. When space opens, the longest-waiting task gets it first.
+
+Key behavior: if task C is waiting and task D is triggered (even though D would fit), D waits behind C. This prevents smaller tasks from starving larger ones.
+
+```
+Pool: 2080B
+A(1000B) + B(1000B) = 2000B → 80B free
+C(2000B) → doesn't fit, waits (waiter #1)
+D( 56B) → would fit (80B > 56B), but waits behind C (waiter #2)
+
+A completes → 1080B free → C still doesn't fit, D still waits
+B completes → 2080B free → C fits! C allocated. D fits! D allocated.
+```
 
 ## Thread-Local Context
 
@@ -371,13 +400,12 @@ This allows:
 - **No dynamic task registration** — tasks must be known at compile time
 - **No cross-engine signals** — signals are local to a single engine instance
 - **No cancellation** — once triggered, a task runs until it suspends or completes
-- **Scratchpad pool** — not yet implemented (planned: shared memory for one-shot tasks)
+- **Scratchpad tasks are arg-free** — data flows through signals/channels, not function arguments
 
 ## Future Directions
 
 See [roadmap.md](roadmap.md) for planned features:
 - Task lifecycle management (`cancel()`, `join()`)
-- Scratchpad pool for one-shot tasks (`cr::scratch<&T::method>`)
 - RP2040 clock implementation
 
 ## Engine Diagnostics
@@ -406,13 +434,14 @@ Frame sizes are probed at engine construction by creating and destroying each co
 
 ## Examples
 
-Six runnable examples live under `examples/`:
+Seven runnable examples live under `examples/`:
 
 | Directory | What it shows |
 |-----------|---------------|
 | `examples/basic/` | Free-function tasks wired through `register_task` + `make_engine`. Producer/consumer over a signal. The simplest end-to-end demo. |
-| `examples/error_handling/` | Exercises every error code (`task_already_running`, `capacity_exceeded`, `listener_limit_exceeded`) with a deliberately small `Config` so the limits are easy to hit. |
+| `examples/error_handling/` | Exercises every error code (`task_already_running`, `capacity_exceeded`, `listener_limit_exceeded`, `pool_overflow`) with a deliberately small `Config` so the limits are easy to hit. |
 | `examples/member_task/` | Member-function API with `reactor_tasks` aliases and `register_instance`. Three classes — two mock sensors and a serial printer consumer. |
 | `examples/instance_trigger/` | Instance-based trigger dispatch. Two instances of the same sensor class, triggered independently by instance reference. Shows `dump()` with accurate frame sizes. |
+| `examples/scratchpad/` | Scratchpad pool with FIFO ordering. Four tasks with different frame sizes. Shows how D would fit but waits behind C (FIFO). Demonstrates `co_await trigger()` blocking behavior. |
 | `examples/channel/` | Point-to-point communication with `channel<T, Capacity>`. ISR-to-task data flow with blocking `pop()` and non-blocking `try_push()`. |
 | `examples/timer/` | Side-by-side comparison of all three timer primitives — `delay_ms` (drifty), `delay_until` (precise), `delay_quantized` (grid-aligned). |

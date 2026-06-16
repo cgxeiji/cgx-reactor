@@ -287,7 +287,7 @@ TEST(InstanceTriggerTest, DumpReturnsCorrectStats) {
     EXPECT_EQ(r.task_count, 3u);
     EXPECT_EQ(r.reserved_count, 3u);
     EXPECT_EQ(r.scratchpad_count, 0u);
-    EXPECT_EQ(r.scratchpad_size, 0u);
+    EXPECT_EQ(r.scratchpad_size, 2048u);
 }
 
 TEST(InstanceTriggerTest, DumpWithCustomSink) {
@@ -302,21 +302,23 @@ TEST(InstanceTriggerTest, DumpWithCustomSink) {
         sink_lines.push_back(std::string(line));
     });
 
-    // Pool summary line + 3 per-task lines
-    ASSERT_GE(sink_lines.size(), 4u);
+    // Reserved pool summary + scratchpad pool summary + 3 per-task lines
+    ASSERT_GE(sink_lines.size(), 5u);
     EXPECT_EQ(r.task_count, 3u);
 
-    // First line is the pool summary
+    // First line is the reserved pool summary
     EXPECT_NE(sink_lines[0].find("Reserved pool:"), std::string::npos);
+    // Second line is the scratchpad pool summary
+    EXPECT_NE(sink_lines[1].find("Scratchpad pool:"), std::string::npos);
 
     // Per-task lines should start with [0], [1], [2]
-    EXPECT_TRUE(sink_lines[1].starts_with("[0]"));
-    EXPECT_TRUE(sink_lines[2].starts_with("[1]"));
-    EXPECT_TRUE(sink_lines[3].starts_with("[2]"));
+    EXPECT_TRUE(sink_lines[2].starts_with("[0]"));
+    EXPECT_TRUE(sink_lines[3].starts_with("[1]"));
+    EXPECT_TRUE(sink_lines[4].starts_with("[2]"));
 
     // Should contain "offset=" and "size="
-    EXPECT_NE(sink_lines[1].find("offset="), std::string::npos);
-    EXPECT_NE(sink_lines[1].find("size="), std::string::npos);
+    EXPECT_NE(sink_lines[2].find("offset="), std::string::npos);
+    EXPECT_NE(sink_lines[2].find("size="), std::string::npos);
 }
 
 TEST(InstanceTriggerTest, DumpWithNoLoggerReturnsStats) {
@@ -399,9 +401,10 @@ TEST(InstanceTriggerTest, DumpShowsProbedFrameSize) {
 
     // Each per-task dump line should contain "size=" followed by a number.
     // The frame size should be non-zero (probed at construction).
-    // Skip the first line (pool summary), check the remaining per-task lines.
-    ASSERT_GE(capture_logger::lines.size(), 4u);  // summary + 3 tasks
-    for (std::size_t i = 1; i < capture_logger::lines.size(); ++i) {
+    // Skip the two summary lines (reserved pool, scratchpad pool),
+    // check the remaining per-task lines.
+    ASSERT_GE(capture_logger::lines.size(), 5u);  // 2 summaries + 3 tasks
+    for (std::size_t i = 2; i < capture_logger::lines.size(); ++i) {
         const auto& line = capture_logger::lines[i];
         auto pos = line.find("size=");
         ASSERT_NE(pos, std::string::npos) << "line missing size=: " << line;
@@ -430,13 +433,14 @@ TEST(InstanceTriggerTest, PoolSizingShowsCorrectUsage) {
         sink_lines.push_back(std::string(line));
     });
 
-    // First line is pool summary
-    ASSERT_GE(sink_lines.size(), 2u);
+    // 2 summary lines + 1 per-task line
+    ASSERT_GE(sink_lines.size(), 3u);
     EXPECT_NE(sink_lines[0].find("Reserved pool:"), std::string::npos);
     EXPECT_NE(sink_lines[0].find("/ 8192B used"), std::string::npos);
+    EXPECT_NE(sink_lines[1].find("Scratchpad pool:"), std::string::npos);
 
-    // Per-task line should have correct size (set_val has params, gets fallback)
-    EXPECT_NE(sink_lines[1].find("size=1024B"), std::string::npos);
+    // Per-task line (index 2) should have correct size (set_val has params, gets fallback)
+    EXPECT_NE(sink_lines[2].find("size=1024B"), std::string::npos);
 }
 
 TEST(InstanceTriggerTest, FrameProbingCapturesNoArgTasks) {
@@ -452,36 +456,37 @@ TEST(InstanceTriggerTest, FrameProbingCapturesNoArgTasks) {
         sink_lines.push_back(std::string(line));
     });
 
-    // 1 pool summary + 3 per-task lines
-    ASSERT_GE(sink_lines.size(), 4u);
+    // 2 pool summaries + 3 per-task lines
+    ASSERT_GE(sink_lines.size(), 5u);
 
-    // init (index 0): no-arg member, should be probed (small, <= 64B)
-    EXPECT_NE(sink_lines[1].find("test_driver::init"), std::string::npos);
-    EXPECT_TRUE(sink_lines[1].find("size=") != std::string::npos)
-        << "init missing size=: " << sink_lines[1];
+    // Per-task lines start at index 2 (after reserved + scratchpad summaries)
+    // init (index 2): no-arg member, should be probed (small, <= 64B)
+    EXPECT_NE(sink_lines[2].find("test_driver::init"), std::string::npos);
+    EXPECT_TRUE(sink_lines[2].find("size=") != std::string::npos)
+        << "init missing size=: " << sink_lines[2];
     {
         // Extract size value and verify it's small (probed, not fallback)
-        auto pos = sink_lines[1].find("size=") + 5;
-        auto end = sink_lines[1].find('B', pos);
-        auto sz = std::stoul(sink_lines[1].substr(pos, end - pos));
-        EXPECT_LT(sz, 256u) << "init probed size should be small: " << sink_lines[1];
-        EXPECT_GT(sz, 0u) << "init probed size should be non-zero: " << sink_lines[1];
-    }
-
-    // loop (index 1): no-arg member, should be probed (small, <= 64B)
-    EXPECT_NE(sink_lines[2].find("test_driver::loop"), std::string::npos);
-    {
         auto pos = sink_lines[2].find("size=") + 5;
         auto end = sink_lines[2].find('B', pos);
         auto sz = std::stoul(sink_lines[2].substr(pos, end - pos));
-        EXPECT_LT(sz, 256u) << "loop probed size should be small: " << sink_lines[2];
-        EXPECT_GT(sz, 0u) << "loop probed size should be non-zero: " << sink_lines[2];
+        EXPECT_LT(sz, 256u) << "init probed size should be small: " << sink_lines[2];
+        EXPECT_GT(sz, 0u) << "init probed size should be non-zero: " << sink_lines[2];
     }
 
-    // fire_once (index 2): takes int param, NOT probed, gets fallback 1024B
-    EXPECT_NE(sink_lines[3].find("test_driver::fire_once"), std::string::npos);
-    EXPECT_NE(sink_lines[3].find("size=1024B"), std::string::npos)
-        << "fire_once should get fallback: " << sink_lines[3];
+    // loop (index 3): no-arg member, should be probed (small, <= 64B)
+    EXPECT_NE(sink_lines[3].find("test_driver::loop"), std::string::npos);
+    {
+        auto pos = sink_lines[3].find("size=") + 5;
+        auto end = sink_lines[3].find('B', pos);
+        auto sz = std::stoul(sink_lines[3].substr(pos, end - pos));
+        EXPECT_LT(sz, 256u) << "loop probed size should be small: " << sink_lines[3];
+        EXPECT_GT(sz, 0u) << "loop probed size should be non-zero: " << sink_lines[3];
+    }
+
+    // fire_once (index 4): takes int param, NOT probed, gets fallback 1024B
+    EXPECT_NE(sink_lines[4].find("test_driver::fire_once"), std::string::npos);
+    EXPECT_NE(sink_lines[4].find("size=1024B"), std::string::npos)
+        << "fire_once should get fallback: " << sink_lines[4];
 }
 
 TEST(InstanceTriggerTest, PoolAlignment) {
@@ -495,9 +500,9 @@ TEST(InstanceTriggerTest, PoolAlignment) {
         sink_lines.push_back(std::string(line));
     });
 
-    // Per-task lines (skip pool summary at index 0)
-    ASSERT_GE(sink_lines.size(), 4u);
-    for (std::size_t i = 1; i < sink_lines.size(); ++i) {
+    // Per-task lines (skip the two summary lines at indices 0 and 1)
+    ASSERT_GE(sink_lines.size(), 5u);
+    for (std::size_t i = 2; i < sink_lines.size(); ++i) {
         const auto& line = sink_lines[i];
         auto pos = line.find("offset=");
         ASSERT_NE(pos, std::string::npos) << "line missing offset=: " << line;

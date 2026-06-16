@@ -58,6 +58,32 @@ class MyDriver {
 ```
 _Avoid_: Task set, task list (as a runtime concept), task table, task registry
 
+**Scratch Task**:
+A one-shot task that shares a scratchpad pool with other scratch tasks. Marked with `cr::scratch<&T::method>` in the `reactor_tasks` alias. Scratch tasks are allocated from the scratchpad pool on trigger and freed on completion. They are arg-free — data flows through signals/channels.
+```cpp
+using reactor_tasks = cr::task_list<
+    &MyDriver::loop,                    // reserved (permanent)
+    cr::scratch<&MyDriver::init>        // scratchpad (one-shot)
+>;
+```
+_Avoid_: One-shot task, temporary task, pooled task
+
+**Reserved Task**:
+A task that permanently occupies a slot in the reserved pool. The default task type — not marked with `cr::scratch`. Reserved tasks are allocated at engine construction and never freed.
+_Avoid_: Permanent task, fixed task
+
+**Scratchpad Pool**:
+A shared memory pool for scratch tasks. Sized via `Config::scratchpad_pool_size` (default 2048B). Scratch tasks allocate from this pool on trigger and free on completion. Uses a bitmap allocator with 16-byte block granularity.
+_Avoid_: Task pool, shared pool
+
+**Scratchpad Waiter**:
+A task that is blocked waiting for space in the scratchpad pool. When the pool is full, new triggers join a FIFO waiter list. When space opens, the longest-waiting task gets it first.
+_Avoid_: Queued task, pending task
+
+**FIFO Ordering**:
+The scratchpad pool uses FIFO ordering for waiters. If task C is waiting and task D is triggered (even though D would fit), D waits behind C. This prevents smaller tasks from starving larger ones.
+_Avoid_: Queue ordering, waiter ordering
+
 ### Task Lifecycle States
 
 **Idle**:
@@ -72,7 +98,7 @@ Task is waiting on something (timer expiry, signal fire, etc.). Not running, not
 ### Configuration
 
 **Config**:
-Compile-time policy struct passed as template parameter to engine. Specifies max_timers, max_signal_listeners, optionally task_frame_size (defaults to 1024 bytes), and min_level (log level filter, defaults to `log_level::info`).
+Compile-time policy struct passed as template parameter to engine. Specifies max_timers, max_signal_listeners, reserved_pool_size (default 8192), scratchpad_pool_size (default 2048), and min_level (log level filter, defaults to `log_level::info`).
 _Avoid_: Settings, options, parameters
 
 ### Engine Operations

@@ -62,6 +62,15 @@ All barebones items are complete (this milestone was reached before the refactor
 ## Upcoming
 
 - **Task lifecycle (`cancel()`, `join()`)** — explicit management of running tasks
-- **Scratchpad pool** — shared memory for one-shot tasks (`cr::scratch<&T::method>`)
 - **RP2040 clock implementation** — reference implementation for Pico SDK
 - **Custom awaitable examples** — `next_byte` for UART, `wait_for_pin` for GPIO
+
+## 2026-06-15 — Scratchpad Pool ✓
+
+- **~~Scratchpad pool~~** — Shared memory pool for one-shot tasks. `cr::scratch<&T::method>` marks tasks as scratchpad. Pool sized via `Config::scratchpad_pool_size` (default 2048B). Bitmap allocator with 16-byte block granularity.
+- **~~FIFO ordering~~** — Scratchpad tasks wait in line even if space available. Prevents smaller tasks from starving larger ones. If C is waiting and D is triggered (even though D would fit), D waits behind C.
+- **~~Blocking trigger~~** — `co_await eng.trigger<&fn>()` suspends the caller when the pool is full and resumes when space opens. `try_trigger<&fn>()` is the non-blocking alternative.
+- **~~Reserved pool refactor~~** — Replaced fixed-size slots with user-defined reserved pool (`Config::reserved_pool_size`, default 8192B). Frame sizes probed at construction.
+- **~~Task descriptor flags~~** — `is_scratchpad` flag in `task_descriptor` distinguishes reserved and scratchpad tasks.
+- **~~Test coverage~~** — 86 tests total. New tests: scratchpad allocation, mixed reserved/scratchpad, pool reuse, FIFO ordering, queue-full, instance dispatch, dump, report, destructor safety.
+- **~~Scratchpad example~~** — `examples/scratchpad/` demonstrates FIFO ordering with 4 concurrent tasks. Shows D waiting behind C even though D would fit.

@@ -57,6 +57,21 @@ constexpr tag<Cs...> make_tag() noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// scratch<Fn> — marks a task as scratchpad (one-shot, pool-allocated)
+// ---------------------------------------------------------------------------
+
+template <auto Fn>
+struct scratch {
+    static constexpr auto fn = Fn;
+    using fn_type = decltype(Fn);
+};
+
+/// Variable template so scratch<Fn> can be used as an NTTP in task_list:
+///   task_list<scratch_v<&method>, &other_method>
+template <auto Fn>
+constexpr scratch<Fn> scratch_v{};
+
+// ---------------------------------------------------------------------------
 // Task list — declared in the user's class header to enumerate member tasks
 // ---------------------------------------------------------------------------
 
@@ -118,9 +133,11 @@ struct task_meta {
     std::coroutine_handle<> handle;
     bool occupied = false;
     bool suspended = true;
+    bool is_scratchpad = false;
     void* self = nullptr;
-    std::size_t offset = 0;
-    std::size_t size = 0;
+    std::size_t offset = 0;          // reserved pool offset
+    std::size_t size = 0;             // coroutine frame size
+    std::size_t scratch_offset = 0;   // offset in scratchpad pool (0 = not allocated)
 };
 
 } // namespace detail
@@ -190,6 +207,22 @@ struct type_at<0, T, Rest...> {
 template <std::size_t I, typename T, typename... Rest>
 struct type_at<I, T, Rest...> : type_at<I - 1, Rest...> {};
 
+// Traits to detect and unwrap scratch<> wrappers
+template <typename T>
+struct is_scratch_type : std::false_type {};
+
+template <auto Fn>
+struct is_scratch_type<scratch<Fn>> : std::true_type {};
+
+template <auto Entry>
+constexpr auto unwrap_entry() noexcept {
+    if constexpr (is_scratch_type<decltype(Entry)>::value) {
+        return decltype(Entry)::fn;
+    } else {
+        return Entry;
+    }
+}
+
 // Count total slots from a pack of specs
 template <typename... Specs>
 struct count_slots;
@@ -206,13 +239,15 @@ template <auto Tag, auto Fn, typename... Rest>
 struct count_slots<free_spec<Tag, Fn>, Rest...>
     : std::integral_constant<std::size_t, 1 + count_slots<Rest...>::value> {};
 
-// Per-slot descriptor: carries function pointer (NTTP), tag (NTTP), class type
-template <auto Fn_, auto Tag_, typename Class_>
+// Per-slot descriptor: carries function pointer (NTTP), tag (NTTP), class type,
+// and a flag indicating whether the task uses the scratchpad pool.
+template <auto Fn_, auto Tag_, typename Class_, bool IsScratchpad_ = false>
 struct task_descriptor {
     static constexpr auto fn = Fn_;
     using tag_type = decltype(Tag_);
     static constexpr auto tag_value = Tag_;
     using class_type = Class_;
+    static constexpr bool is_scratchpad = IsScratchpad_;
 };
 
 // Flatten a pack of specs into a flat type_list of task_descriptors
@@ -227,8 +262,17 @@ struct spec_unfolder<> {
 template <typename Class, auto Tag, auto... MemFns, typename... Rest>
 struct spec_unfolder<bound<Class, Tag, MemFns...>, Rest...> {
     using rest = typename spec_unfolder<Rest...>::type;
+    
+    template <auto MF>
+    using normalized_desc = task_descriptor<
+        unwrap_entry<MF>(),
+        Tag,
+        Class,
+        is_scratch_type<decltype(MF)>::value
+    >;
+    
     using type = typename concat<
-        type_list<task_descriptor<MemFns, Tag, Class>...>,
+        type_list<normalized_desc<MemFns>...>,
         rest
     >::type;
 };
@@ -237,7 +281,7 @@ template <auto Tag, auto Fn, typename... Rest>
 struct spec_unfolder<free_spec<Tag, Fn>, Rest...> {
     using rest = typename spec_unfolder<Rest...>::type;
     using type = typename concat<
-        type_list<task_descriptor<Fn, Tag, void>>,
+        type_list<task_descriptor<Fn, Tag, void, false>>,
         rest
     >::type;
 };

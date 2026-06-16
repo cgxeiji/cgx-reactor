@@ -9,6 +9,16 @@ struct small_config {
     static constexpr std::size_t max_timers = 2;           // Only 2 timers allowed
     static constexpr std::size_t max_signal_listeners = 2; // Only 2 listeners allowed
     static constexpr std::size_t reserved_pool_size = 8192;
+    static constexpr std::size_t scratchpad_pool_size = 2048;
+    static constexpr log_level min_level = log_level::info;
+};
+
+// Micro-pool config for overflow demo — too small for any real coroutine
+struct tiny_pool_config {
+    static constexpr std::size_t max_timers = 2;
+    static constexpr std::size_t max_signal_listeners = 2;
+    static constexpr std::size_t reserved_pool_size = 16;
+    static constexpr std::size_t scratchpad_pool_size = 2048;
     static constexpr log_level min_level = log_level::info;
 };
 
@@ -104,6 +114,16 @@ task listener_task_3() {
 }
 
 // ---------------------------------------------------------------------------
+// Error 4: pool overflow — tiny pool can't hold any real coroutine
+// ---------------------------------------------------------------------------
+
+task any_coroutine() {
+    // This coroutine is too large for a 16-byte reserved pool.
+    std::cout << "[pool] This message never appears — pool too small\n";
+    co_return;
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -130,7 +150,7 @@ int main() {
     std::cout << "\n";
 
     // Error 2: capacity_exceeded
-    std::cout << "--- Error 2: capacity_exceeded ---\n";
+    std::cout << "--- Error 2: capacity_exceeded (timers) ---\n";
     std::cout << "Triggering 3 tasks that each add a timer (max_timers=2)...\n";
     eng.template trigger<&timer_task_a>();
     eng.template trigger<&timer_task_b>();
@@ -150,6 +170,19 @@ int main() {
     std::cout << "\nFiring signal to resume listeners...\n";
     limited_signal.fire(42);
     eng.tick();
+
+    std::cout << "\n";
+
+    // Error 4: pool overflow
+    std::cout << "--- Error 4: pool overflow ---\n";
+    {
+        auto tiny_eng = make_engine<tiny_pool_config, steady_clock>(
+            register_task<"OVER"_tag, &any_coroutine>());
+
+        std::cout << "pool_exhausted(): " << (tiny_eng.pool_exhausted() ? "true" : "false") << "\n";
+        ec = tiny_eng.template trigger<&any_coroutine>();
+        std::cout << "Trigger result: " << to_string(ec) << "\n";
+    }  // tiny_eng destroyed here
 
     std::cout << "\n=== Example Complete ===\n";
     return 0;

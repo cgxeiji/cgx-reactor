@@ -65,8 +65,8 @@ TEST(MemberTaskTest, TriggerMemberFunctionFireAndReturn) {
         register_instance(drv));
 
     // Trigger the fire-and-return member function.
-    auto ec = eng.template trigger<&fake_driver::fire_once>(42);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&fake_driver::fire_once>(42);
+    ASSERT_EQ(h.error(), error::ok);
 
     // The task should have run to completion immediately.
     EXPECT_EQ(drv.recorded(), 42);
@@ -80,8 +80,8 @@ TEST(MemberTaskTest, TriggerMemberFunctionLoopAndIncrement) {
         register_instance(drv));
 
     // Trigger the infinite-loop member function.
-    auto ec = eng.template trigger<&fake_driver::run_loop>();
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&fake_driver::run_loop>();
+    ASSERT_EQ(h.error(), error::ok);
 
     // Suspended at first co_await — counter not incremented yet.
     EXPECT_EQ(drv.counter(), 0);
@@ -102,20 +102,20 @@ TEST(MemberTaskTest, AlreadyRunningForMemberFn) {
         register_instance(drv));
 
     // Trigger the loop — it suspends immediately.
-    auto ec = eng.template trigger<&fake_driver::run_loop>();
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&fake_driver::run_loop>();
+    ASSERT_EQ(h.error(), error::ok);
 
     // Second trigger while running should fail.
-    ec = eng.template trigger<&fake_driver::run_loop>();
-    ASSERT_EQ(ec, error::task_already_running);
+    h = eng.template trigger<&fake_driver::run_loop>();
+    ASSERT_EQ(h.error(), error::task_already_running);
 
     // Tick advances one iteration.
     eng.tick();
     EXPECT_EQ(drv.counter(), 1);
 
     // Still running, so trigger still fails.
-    ec = eng.template trigger<&fake_driver::run_loop>();
-    ASSERT_EQ(ec, error::task_already_running);
+    h = eng.template trigger<&fake_driver::run_loop>();
+    ASSERT_EQ(h.error(), error::task_already_running);
 }
 
 TEST(MemberTaskTest, TwoInstancesWithDifferentTags) {
@@ -128,8 +128,8 @@ TEST(MemberTaskTest, TwoInstancesWithDifferentTags) {
         register_instance(drv_b));
 
     // Trigger run_loop on drv_a (first match wins with slot_index).
-    auto ec = eng.template trigger<&fake_driver::run_loop>();
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&fake_driver::run_loop>();
+    ASSERT_EQ(h.error(), error::ok);
 
     // Tick once — only drv_a's loop should advance.
     eng.tick();
@@ -137,8 +137,8 @@ TEST(MemberTaskTest, TwoInstancesWithDifferentTags) {
     EXPECT_EQ(drv_b.counter(), 0);
 
     // Can't trigger the same function pointer again — it's already running.
-    ec = eng.template trigger<&fake_driver::run_loop>();
-    ASSERT_EQ(ec, error::task_already_running);
+    h = eng.template trigger<&fake_driver::run_loop>();
+    ASSERT_EQ(h.error(), error::task_already_running);
 }
 
 TEST(MemberTaskTest, FreeFunctionAndMemberTaskTogether) {
@@ -150,13 +150,13 @@ TEST(MemberTaskTest, FreeFunctionAndMemberTaskTogether) {
         register_instance(drv));
 
     // Trigger the free function task.
-    auto ec = eng.template trigger<&free_inc>(free_cnt);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&free_inc>(free_cnt);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(free_cnt, 1);
 
     // Trigger the member-function task.
-    ec = eng.template trigger<&fake_driver::fire_once>(99);
-    ASSERT_EQ(ec, error::ok);
+    h = eng.template trigger<&fake_driver::fire_once>(99);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(drv.recorded(), 99);
 }
 

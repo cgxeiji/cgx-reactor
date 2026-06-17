@@ -74,26 +74,26 @@ int main() {
 
     // Trigger all three tasks.
     {
-        auto ec = eng.template trigger<&drifty_task>();
-        if (ec != cgx::reactor::error::ok) {
+        auto h = eng.template trigger<&drifty_task>();
+        if (h.error() != cgx::reactor::error::ok) {
             std::fprintf(stderr, "drifty trigger failed: %s\n",
-                         cgx::reactor::to_string(ec).data());
+                         cgx::reactor::to_string(h.error()).data());
             return EXIT_FAILURE;
         }
     }
     {
-        auto ec = eng.template trigger<&precise_task>();
-        if (ec != cgx::reactor::error::ok) {
+        auto h = eng.template trigger<&precise_task>();
+        if (h.error() != cgx::reactor::error::ok) {
             std::fprintf(stderr, "precise trigger failed: %s\n",
-                         cgx::reactor::to_string(ec).data());
+                         cgx::reactor::to_string(h.error()).data());
             return EXIT_FAILURE;
         }
     }
     {
-        auto ec = eng.template trigger<&quantized_task>();
-        if (ec != cgx::reactor::error::ok) {
+        auto h = eng.template trigger<&quantized_task>();
+        if (h.error() != cgx::reactor::error::ok) {
             std::fprintf(stderr, "quantized trigger failed: %s\n",
-                         cgx::reactor::to_string(ec).data());
+                         cgx::reactor::to_string(h.error()).data());
             return EXIT_FAILURE;
         }
     }

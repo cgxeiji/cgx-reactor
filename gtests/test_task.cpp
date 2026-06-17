@@ -44,8 +44,8 @@ TEST(TaskTest, FireAndReturn) {
     auto eng = make_engine<default_config, test::mock_clock>(
         register_task<&increment_counter>());
 
-    auto ec = eng.template trigger<&increment_counter>(counter);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&increment_counter>(counter);
+    ASSERT_EQ(h.error(), error::ok);
     // Task ran to completion immediately (no suspension points).
     EXPECT_EQ(counter, 1);
 }
@@ -56,8 +56,8 @@ TEST(TaskTest, TriggerTickAndReTrigger) {
         register_task<&increment_after_suspend>());
 
     // First trigger -- suspends at first co_await.
-    auto ec = eng.template trigger<&increment_after_suspend>(counter);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&increment_after_suspend>(counter);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(counter, 0);  // Not incremented yet
 
     // Tick -- resumes, increments, completes.
@@ -65,8 +65,8 @@ TEST(TaskTest, TriggerTickAndReTrigger) {
     EXPECT_EQ(counter, 1);  // Now incremented
 
     // Re-trigger -- should work since task completed.
-    ec = eng.template trigger<&increment_after_suspend>(counter);
-    ASSERT_EQ(ec, error::ok);
+    h = eng.template trigger<&increment_after_suspend>(counter);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(counter, 1);  // Not incremented yet (suspended)
 
     eng.tick();
@@ -79,20 +79,20 @@ TEST(TaskTest, AlreadyRunning) {
         register_task<&infinite_loop>());
 
     // First trigger -- suspends at first co_await.
-    auto ec = eng.template trigger<&infinite_loop>(counter);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&infinite_loop>(counter);
+    ASSERT_EQ(h.error(), error::ok);
 
     // Trying to trigger again while running should fail.
-    ec = eng.template trigger<&infinite_loop>(counter);
-    ASSERT_EQ(ec, error::task_already_running);
+    h = eng.template trigger<&infinite_loop>(counter);
+    ASSERT_EQ(h.error(), error::task_already_running);
 
     // Tick -- advances one iteration.
     eng.tick();
     EXPECT_EQ(counter, 1);
 
     // Task is still alive (looping), still occupied.
-    ec = eng.template trigger<&infinite_loop>(counter);
-    ASSERT_EQ(ec, error::task_already_running);
+    h = eng.template trigger<&infinite_loop>(counter);
+    ASSERT_EQ(h.error(), error::task_already_running);
 }
 
 TEST(TaskTest, EngineSizeIsValidConstant) {

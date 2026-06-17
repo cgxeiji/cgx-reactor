@@ -141,11 +141,11 @@ int main() {
 
     // Error 1: task_already_running
     std::cout << "--- Error 1: task_already_running ---\n";
-    auto ec = eng.template trigger<&long_running_task>();
-    std::cout << "First trigger: " << to_string(ec) << "\n";
+    auto h = eng.template trigger<&long_running_task>();
+    std::cout << "First trigger: " << to_string(h.error()) << "\n";
 
-    ec = eng.template trigger<&long_running_task>();
-    std::cout << "Second trigger (should fail): " << to_string(ec) << "\n";
+    h = eng.template trigger<&long_running_task>();
+    std::cout << "Second trigger (should fail): " << to_string(h.error()) << "\n";
 
     std::cout << "\n";
 
@@ -180,8 +180,8 @@ int main() {
             register_task<&any_coroutine>());
 
         std::cout << "pool_exhausted(): " << (tiny_eng.pool_exhausted() ? "true" : "false") << "\n";
-        ec = tiny_eng.template trigger<&any_coroutine>();
-        std::cout << "Trigger result: " << to_string(ec) << "\n";
+        auto h = tiny_eng.template trigger<&any_coroutine>();
+        std::cout << "Trigger result: " << to_string(h.error()) << "\n";
     }  // tiny_eng destroyed here
 
     std::cout << "\n=== Example Complete ===\n";

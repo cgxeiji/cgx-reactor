@@ -90,8 +90,8 @@ TEST(SignalTest, SingleListener) {
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
         cr::register_task<&one_shot_listener>());
 
-    auto ec = eng.template trigger<&one_shot_listener>(sig, result);
-    ASSERT_EQ(ec, cr::error::ok);
+    auto h = eng.template trigger<&one_shot_listener>(sig, result);
+    ASSERT_EQ(h.error(), cr::error::ok);
 
     // Task should be suspended at listen().
     EXPECT_EQ(result, 0);
@@ -114,8 +114,8 @@ TEST(SignalTest, ListenThroughConstRef) {
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
         cr::register_task<&const_listener>());
 
-    auto ec = eng.template trigger<&const_listener>(sig, result);
-    ASSERT_EQ(ec, cr::error::ok);
+    auto h = eng.template trigger<&const_listener>(sig, result);
+    ASSERT_EQ(h.error(), cr::error::ok);
     EXPECT_EQ(result, 0);
 
     sig.fire(77);
@@ -135,12 +135,12 @@ TEST(SignalTest, ThreeListenersAllReceiveValue) {
         cr::register_task<&listener_b>(),
         cr::register_task<&listener_c>());
 
-    auto ec = eng.template trigger<&listener_a>(sig, r1);
-    ASSERT_EQ(ec, cr::error::ok);
-    ec = eng.template trigger<&listener_b>(sig, r2);
-    ASSERT_EQ(ec, cr::error::ok);
-    ec = eng.template trigger<&listener_c>(sig, r3);
-    ASSERT_EQ(ec, cr::error::ok);
+    auto h = eng.template trigger<&listener_a>(sig, r1);
+    ASSERT_EQ(h.error(), cr::error::ok);
+    h = eng.template trigger<&listener_b>(sig, r2);
+    ASSERT_EQ(h.error(), cr::error::ok);
+    h = eng.template trigger<&listener_c>(sig, r3);
+    ASSERT_EQ(h.error(), cr::error::ok);
 
     // All three are now suspended at listen().
     EXPECT_EQ(r1, 0);
@@ -165,8 +165,8 @@ TEST(SignalTest, MultipleCycles) {
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
         cr::register_task<&two_cycle_listener>());
 
-    auto ec = eng.template trigger<&two_cycle_listener>(sig, out1, out2);
-    ASSERT_EQ(ec, cr::error::ok);
+    auto h = eng.template trigger<&two_cycle_listener>(sig, out1, out2);
+    ASSERT_EQ(h.error(), cr::error::ok);
 
     // Cycle 1
     sig.fire(10);
@@ -192,14 +192,14 @@ TEST(SignalTest, ListenerLimitExceeded) {
         cr::register_task<&overflow_detector>());
 
     // Fill the single listener slot.
-    auto ec = eng.template trigger<&filler>(sig);
-    ASSERT_EQ(ec, cr::error::ok);
+    auto h = eng.template trigger<&filler>(sig);
+    ASSERT_EQ(h.error(), cr::error::ok);
 
     // The next listen() should detect overflow.  Because the overflow
     // checker never suspends (await_suspend returns false), it runs to
     // completion during trigger().  The slot is free again immediately.
-    ec = eng.template trigger<&overflow_detector>(sig, overflow);
-    ASSERT_EQ(ec, cr::error::ok);
+    h = eng.template trigger<&overflow_detector>(sig, overflow);
+    ASSERT_EQ(h.error(), cr::error::ok);
     EXPECT_TRUE(overflow);
 }
 
@@ -240,10 +240,10 @@ TEST(SignalTest, EngineIntegration) {
 
     // Trigger consumer FIRST so its timer sits at index 0 and will be
     // processed before the producer's timer in tick() step (b).
-    auto ec = eng.template trigger<&consumer>(sig, received);
-    ASSERT_EQ(ec, cr::error::ok);
-    ec = eng.template trigger<&producer>(sig, counter);
-    ASSERT_EQ(ec, cr::error::ok);
+    auto h = eng.template trigger<&consumer>(sig, received);
+    ASSERT_EQ(h.error(), cr::error::ok);
+    h = eng.template trigger<&producer>(sig, counter);
+    ASSERT_EQ(h.error(), cr::error::ok);
 
     EXPECT_EQ(received, 0);
 

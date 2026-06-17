@@ -137,21 +137,21 @@ int main() {
         cr::register_instance(proc));
 
     // Start processor tasks first
-    auto ec = eng.template trigger<&processor::fast_buffer>(rx);
-    if (ec != cr::error::ok) {
+    auto h = eng.template trigger<&processor::fast_buffer>(rx);
+    if (h.error() != cr::error::ok) {
         std::fprintf(stderr, "fast_buffer trigger failed\n");
         return EXIT_FAILURE;
     }
 
-    ec = eng.template trigger<&processor::process>();
-    if (ec != cr::error::ok) {
+    h = eng.template trigger<&processor::process>();
+    if (h.error() != cr::error::ok) {
         std::fprintf(stderr, "process trigger failed\n");
         return EXIT_FAILURE;
     }
 
     // Start receiver
-    ec = eng.template trigger<&uart_receiver::receive_loop>();
-    if (ec != cr::error::ok) {
+    h = eng.template trigger<&uart_receiver::receive_loop>();
+    if (h.error() != cr::error::ok) {
         std::fprintf(stderr, "receive_loop trigger failed\n");
         return EXIT_FAILURE;
     }

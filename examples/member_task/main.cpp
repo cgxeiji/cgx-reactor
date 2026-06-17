@@ -133,25 +133,25 @@ int main() {
         cr::register_instance(printer));
 
     // Trigger all three tasks.
-    auto ec = eng.template trigger<&mock_temperature_sensor::poll_loop>();
-    if (ec != cr::error::ok) {
+    auto h = eng.template trigger<&mock_temperature_sensor::poll_loop>();
+    if (h.error() != cr::error::ok) {
         std::fprintf(stderr, "temp trigger failed: %s\n",
-                     cr::to_string(ec).data());
+                     cr::to_string(h.error()).data());
         return EXIT_FAILURE;
     }
 
-    ec = eng.template trigger<&mock_pressure_sensor::poll_loop>();
-    if (ec != cr::error::ok) {
+    h = eng.template trigger<&mock_pressure_sensor::poll_loop>();
+    if (h.error() != cr::error::ok) {
         std::fprintf(stderr, "pressure trigger failed: %s\n",
-                     cr::to_string(ec).data());
+                     cr::to_string(h.error()).data());
         return EXIT_FAILURE;
     }
 
     // The printer's task now takes sensor references.  No global signals.
-    ec = eng.template trigger<&serial_printer::print_loop>(temp_sensor, pressure_sensor);
-    if (ec != cr::error::ok) {
+    h = eng.template trigger<&serial_printer::print_loop>(temp_sensor, pressure_sensor);
+    if (h.error() != cr::error::ok) {
         std::fprintf(stderr, "printer trigger failed: %s\n",
-                     cr::to_string(ec).data());
+                     cr::to_string(h.error()).data());
         return EXIT_FAILURE;
     }
 

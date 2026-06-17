@@ -78,25 +78,25 @@ int main() {
         cr::register_instance(printer));
 
     // Trigger each sensor by instance (instance-based dispatch).
-    auto ec = eng.trigger(sensor_a, &mock_temperature_sensor::poll_loop);
-    if (ec != cr::error::ok) {
+    auto h = eng.trigger(sensor_a, &mock_temperature_sensor::poll_loop);
+    if (h.error() != cr::error::ok) {
         std::fprintf(stderr, "sensor_a trigger failed: %s\n",
-                     cr::to_string(ec).data());
+                     cr::to_string(h.error()).data());
         return EXIT_FAILURE;
     }
 
-    ec = eng.trigger(sensor_b, &mock_temperature_sensor::poll_loop);
-    if (ec != cr::error::ok) {
+    h = eng.trigger(sensor_b, &mock_temperature_sensor::poll_loop);
+    if (h.error() != cr::error::ok) {
         std::fprintf(stderr, "sensor_b trigger failed: %s\n",
-                     cr::to_string(ec).data());
+                     cr::to_string(h.error()).data());
         return EXIT_FAILURE;
     }
 
     // Printer takes sensor references as arguments.
-    ec = eng.trigger(printer, &serial_printer::print_loop, sensor_a, sensor_b);
-    if (ec != cr::error::ok) {
+    h = eng.trigger(printer, &serial_printer::print_loop, sensor_a, sensor_b);
+    if (h.error() != cr::error::ok) {
         std::fprintf(stderr, "printer trigger failed: %s\n",
-                     cr::to_string(ec).data());
+                     cr::to_string(h.error()).data());
         return EXIT_FAILURE;
     }
 

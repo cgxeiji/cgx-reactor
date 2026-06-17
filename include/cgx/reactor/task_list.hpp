@@ -85,6 +85,9 @@ struct task_meta {
     std::size_t offset = 0;          // reserved pool offset
     std::size_t size = 0;             // coroutine frame size
     std::size_t scratch_offset = 0;   // offset in scratchpad pool (0 = not allocated)
+    // Completion waiter (single coroutine waiting via task_handle::done())
+    std::coroutine_handle<> completion_waiter;
+    bool has_completion_waiter = false;
 };
 
 } // namespace detail

@@ -209,8 +209,8 @@ TEST_F(LoggerEngineTest, AlreadyRunningLogsWarning) {
     capture_logger::clear();
 
     // Second trigger while already running.
-    auto ec = eng.template trigger<&delayed_increment>(val);
-    EXPECT_EQ(ec, error::task_already_running);
+    auto h = eng.template trigger<&delayed_increment>(val);
+    EXPECT_EQ(h.error(), error::task_already_running);
 
     ASSERT_FALSE(capture_logger::messages.empty());
     bool found_warning = false;

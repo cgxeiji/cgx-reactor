@@ -82,8 +82,8 @@ TEST(ScratchpadTest, ScratchpadAllocationAndRun) {
         cr::register_instance(drv));
 
     // Use try_trigger for scratchpad in non-coroutine context
-    auto ec = eng.template try_trigger<&scratch_driver::fire>();
-    ASSERT_EQ(ec, cr::error::ok);
+    auto h = eng.template try_trigger<&scratch_driver::fire>();
+    ASSERT_EQ(h.error(), cr::error::ok);
     EXPECT_EQ(drv.val(), 99);
 }
 
@@ -92,15 +92,15 @@ TEST(ScratchpadTest, MixedReservedAndScratchpad) {
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
         cr::register_instance(drv));
 
-    auto ec = eng.template trigger<&mixed_driver::reserved_loop>();
-    ASSERT_EQ(ec, cr::error::ok);
+    auto h = eng.template trigger<&mixed_driver::reserved_loop>();
+    ASSERT_EQ(h.error(), cr::error::ok);
 
-    ec = eng.template try_trigger<&mixed_driver::scratch_once>();
-    ASSERT_EQ(ec, cr::error::ok);
+    h = eng.template try_trigger<&mixed_driver::scratch_once>();
+    ASSERT_EQ(h.error(), cr::error::ok);
     EXPECT_EQ(drv.val(), 42);
 
-    ec = eng.template try_trigger<&mixed_driver::scratch_loop>();
-    ASSERT_EQ(ec, cr::error::ok);
+    h = eng.template try_trigger<&mixed_driver::scratch_loop>();
+    ASSERT_EQ(h.error(), cr::error::ok);
     EXPECT_EQ(drv.count(), 0);
 
     eng.tick();
@@ -112,13 +112,13 @@ TEST(ScratchpadTest, ScratchpadCompletionFreesPool) {
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
         cr::register_instance(drv));
 
-    auto ec = eng.template try_trigger<&scratch_driver::fire>();
-    ASSERT_EQ(ec, cr::error::ok);
+    auto h = eng.template try_trigger<&scratch_driver::fire>();
+    ASSERT_EQ(h.error(), cr::error::ok);
     EXPECT_EQ(drv.val(), 99);
 
     drv = scratch_driver{};
-    ec = eng.template try_trigger<&scratch_driver::fire>();
-    ASSERT_EQ(ec, cr::error::ok);
+    h = eng.template try_trigger<&scratch_driver::fire>();
+    ASSERT_EQ(h.error(), cr::error::ok);
     EXPECT_EQ(drv.val(), 99);
 }
 
@@ -127,11 +127,11 @@ TEST(ScratchpadTest, TryTriggerReturnsOccupied) {
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
         cr::register_instance(drv));
 
-    auto ec = eng.template try_trigger<&mixed_driver::scratch_loop>();
-    ASSERT_EQ(ec, cr::error::ok);
+    auto h = eng.template try_trigger<&mixed_driver::scratch_loop>();
+    ASSERT_EQ(h.error(), cr::error::ok);
 
-    ec = eng.template try_trigger<&mixed_driver::scratch_loop>();
-    ASSERT_EQ(ec, cr::error::task_already_running);
+    h = eng.template try_trigger<&mixed_driver::scratch_loop>();
+    ASSERT_EQ(h.error(), cr::error::task_already_running);
 
     eng.tick();
     EXPECT_EQ(drv.count(), 1);
@@ -152,8 +152,8 @@ TEST(ScratchpadTest, TryTriggerReturnsPoolFull) {
         cr::register_instance(drv));
 
     // Frame is larger than 16B pool → capacity_exceeded
-    auto ec = eng.template try_trigger<&big_driver::big>();
-    ASSERT_EQ(ec, cr::error::capacity_exceeded);
+    auto h = eng.template try_trigger<&big_driver::big>();
+    ASSERT_EQ(h.error(), cr::error::capacity_exceeded);
 }
 
 TEST(ScratchpadTest, InstanceBasedTrigger) {
@@ -162,8 +162,8 @@ TEST(ScratchpadTest, InstanceBasedTrigger) {
         cr::register_instance(drv));
 
     // Trigger via instance + method pointer
-    auto ec = eng.trigger(drv, &mixed_driver::scratch_once);
-    ASSERT_EQ(ec, cr::error::ok);
+    auto h = eng.trigger(drv, &mixed_driver::scratch_once);
+    ASSERT_EQ(h.error(), cr::error::ok);
     EXPECT_EQ(drv.val(), 42);
 }
 
@@ -218,8 +218,8 @@ TEST(ScratchpadTest, DestructorAfterCompletion) {
         auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
             cr::register_instance(drv));
 
-        auto ec = eng.template try_trigger<&scratch_driver::fire>();
-        ASSERT_EQ(ec, cr::error::ok);
+        auto h = eng.template try_trigger<&scratch_driver::fire>();
+        ASSERT_EQ(h.error(), cr::error::ok);
         EXPECT_EQ(drv.val(), 99);
 
         // Engine destroyed here — must not crash
@@ -232,11 +232,11 @@ TEST(ScratchpadTest, DestructorAfterMultipleCompletions) {
         auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
             cr::register_instance(drv));
 
-        auto ec = eng.template try_trigger<&mixed_driver::scratch_once>();
-        ASSERT_EQ(ec, cr::error::ok);
+        auto h = eng.template try_trigger<&mixed_driver::scratch_once>();
+        ASSERT_EQ(h.error(), cr::error::ok);
 
-        ec = eng.template try_trigger<&mixed_driver::scratch_loop>();
-        ASSERT_EQ(ec, cr::error::ok);
+        h = eng.template try_trigger<&mixed_driver::scratch_loop>();
+        ASSERT_EQ(h.error(), cr::error::ok);
 
         // Tick completes scratch_loop
         eng.tick();

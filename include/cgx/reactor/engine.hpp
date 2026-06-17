@@ -207,6 +207,44 @@ class engine {
     // -----------------------------------------------------------------------
 
 public:
+    /// Awaiter returned by task_handle::done(). Suspends until the task
+    /// completes.  Only one waiter per task is supported; a second call
+    /// to done() while a waiter is registered returns false from
+    /// await_suspend (the caller does not suspend).
+    struct task_completion_awaiter {
+        engine* self;
+        std::size_t task_idx;
+
+        bool await_ready() const noexcept {
+            auto& meta = self->tasks_[task_idx];
+            return !meta.occupied || (meta.handle && meta.handle.done());
+        }
+
+        bool await_suspend(std::coroutine_handle<> h) noexcept {
+            auto& meta = self->tasks_[task_idx];
+            if (meta.has_completion_waiter) return false;
+            meta.completion_waiter = h;
+            meta.has_completion_waiter = true;
+            return true;
+        }
+
+        void await_resume() const noexcept {}
+    };
+
+    /// Handle returned by trigger() / try_trigger() for any task type.
+    /// Provides error() to check the result and done() to await completion.
+    struct task_handle {
+        engine* self;
+        std::size_t task_idx;
+        error err;
+
+        error error() const noexcept { return err; }
+
+        task_completion_awaiter done() const noexcept {
+            return {self, task_idx};
+        }
+    };
+
     /// Awaiter returned by trigger() for scratchpad tasks.
     struct scratchpad_trigger_awaiter {
         engine* self;
@@ -236,14 +274,14 @@ public:
             return self->try_add_waiter(task_idx, h);
         }
 
-        error await_resume() const noexcept {
+        task_handle await_resume() const noexcept {
             // Check the actual task state — the waiter may have been
             // resumed by try_resume_waiter() which sets occupied=true
             // and scratch_offset, but doesn't update the allocated flag.
             auto& meta = self->tasks_[task_idx];
             if (meta.occupied && meta.scratch_offset != self->scratch_unused)
-                return error::ok;
-            return allocated ? error::ok : error::capacity_exceeded;
+                return {self, task_idx, error::ok};
+            return {self, task_idx, allocated ? error::ok : error::capacity_exceeded};
         }
     };
 
@@ -267,15 +305,49 @@ private:
             if (meta.occupied) { ++i; continue; }
             std::size_t alloc = scratchpad_allocate(meta.size);
             if (alloc != Config::scratchpad_pool_size) {
-                execute_scratchpad(w.task_index, alloc);
-                w.handle.resume();
+                auto resumed_handle = w.handle;
+                auto resumed_idx = w.task_index;
+                // Remove waiter before resuming to prevent re-entrancy issues
+                // (the resumed coroutine may trigger new tasks and add waiters).
                 for (std::size_t j = i; j + 1 < scratchpad_waiter_count_; ++j)
                     scratchpad_waiters_[j] = scratchpad_waiters_[j + 1];
                 --scratchpad_waiter_count_;
+                execute_scratchpad(resumed_idx, alloc);
+                resumed_handle.resume();
             } else {
                 break;
             }
         }
+    }
+
+    /// Complete a task: free scratchpad memory if applicable, clear
+    /// metadata, resume completion waiter, and try to resume next
+    /// scratchpad waiter.
+    void complete_task(std::size_t i) noexcept {
+        auto& meta = tasks_[i];
+
+        if (meta.is_scratchpad && meta.scratch_offset != scratch_unused) {
+            scratchpad_free(meta.scratch_offset, meta.size);
+            meta.scratch_offset = scratch_unused;
+        }
+
+        meta.handle = {};
+        meta.occupied = false;
+        meta.suspended = true;
+
+        log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
+            "INF", fn_names_[i], "completed");
+
+        // Resume completion waiter if any
+        if (meta.has_completion_waiter) {
+            meta.has_completion_waiter = false;
+            auto h = meta.completion_waiter;
+            meta.completion_waiter = {};
+            h.resume();
+        }
+
+        // Resume next scratchpad waiter (if space freed)
+        if (meta.is_scratchpad) try_resume_waiter();
     }
 
     // -----------------------------------------------------------------------
@@ -375,11 +447,7 @@ private:
             detail::current_timer_registrar = {};
 
             if (meta.handle.done()) {
-                scratchpad_free(alloc, meta.size);
-                meta.scratch_offset = scratch_unused;
-                meta.handle = {};
-                meta.occupied = false;
-                try_resume_waiter();
+                complete_task(I);
             }
 
             log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
@@ -437,8 +505,11 @@ private:
         detail::current_external_suspension_registrar = {};
         detail::current_timer_registrar = {};
 
-        if (meta.handle.done()) meta.occupied = false;
-        else meta.occupied = true;
+        if (meta.handle.done()) {
+            complete_task(I);
+        } else {
+            meta.occupied = true;
+        }
 
         log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
             "INF", fn_names_[I], "triggered");
@@ -450,7 +521,7 @@ private:
     // -----------------------------------------------------------------------
 
     template <std::size_t I, typename Class, typename Fn, typename... Args>
-    bool try_trigger_instance(Class& obj, Fn fn, error& result, Args&&... args) {
+    bool try_trigger_instance(Class& obj, Fn fn, task_handle& result, Args&&... args) {
         using entry_t = typename detail::type_at<I, Entries...>::type;
         using registered_type = std::remove_cv_t<decltype(entry_t::fn)>;
 
@@ -462,10 +533,10 @@ private:
                     result = try_scratchpad(I);
                 } else {
                     if (tasks_[I].occupied) {
-                        result = error::task_already_running;
+                        result = {this, I, error::task_already_running};
                     } else {
                         // Forward args via compile-time dispatch
-                        result = trigger_reserved<I>(std::forward<Args>(args)...);
+                        result = {this, I, trigger_reserved<I>(std::forward<Args>(args)...)};
                     }
                 }
                 return true;
@@ -474,18 +545,18 @@ private:
         return false;
     }
 
-    error try_scratchpad(std::size_t idx) {
+    task_handle try_scratchpad(std::size_t idx) {
         auto& meta = tasks_[idx];
-        if (meta.occupied) return error::task_already_running;
+        if (meta.occupied) return {this, idx, error::task_already_running};
 
         // FIFO ordering: if waiters exist, can't jump ahead.
-        if (scratchpad_waiter_count_ > 0) return error::capacity_exceeded;
+        if (scratchpad_waiter_count_ > 0) return {this, idx, error::capacity_exceeded};
 
         std::size_t alloc = scratchpad_allocate(meta.size);
-        if (alloc == Config::scratchpad_pool_size) return error::capacity_exceeded;
+        if (alloc == Config::scratchpad_pool_size) return {this, idx, error::capacity_exceeded};
 
         execute_scratchpad(idx, alloc);
-        return error::ok;
+        return {this, idx, error::ok};
     }
 
 public:
@@ -551,7 +622,7 @@ public:
             // Return an awaiter that blocks/suspends when pool is full.
             return scratchpad_trigger_awaiter{this, idx, {}, {}};
         } else {
-            return trigger_reserved<idx>(std::forward<Args>(args)...);
+            return task_handle{this, idx, trigger_reserved<idx>(std::forward<Args>(args)...)};
         }
     }
 
@@ -559,10 +630,10 @@ public:
     // Instance-based dispatch is always non-blocking (uses try_trigger semantics
     // for scratchpad tasks).  For blocking behavior, use NTTP-based trigger<&fn>().
     template <typename Class, typename Ret, typename... FnArgs, typename... Args>
-    error trigger(Class& obj, Ret (Class::*fn)(FnArgs...), Args&&... args) {
-        error result = error::task_not_registered;
+    task_handle trigger(Class& obj, Ret (Class::*fn)(FnArgs...), Args&&... args) {
+        task_handle result{this, num_tasks, error::task_not_registered};
         [this, &obj, fn, &result, &args...]<std::size_t... Is>(std::index_sequence<Is...>) {
-            ((result == error::task_not_registered
+            ((result.err == error::task_not_registered
                   ? (try_trigger_instance<Is>(obj, fn, result, std::forward<Args>(args)...), 0)
                   : 0),
              ...);
@@ -572,10 +643,10 @@ public:
 
     // Const member function
     template <typename Class, typename Ret, typename... FnArgs, typename... Args>
-    error trigger(Class& obj, Ret (Class::*fn)(FnArgs...) const, Args&&... args) {
-        error result = error::task_not_registered;
+    task_handle trigger(Class& obj, Ret (Class::*fn)(FnArgs...) const, Args&&... args) {
+        task_handle result{this, num_tasks, error::task_not_registered};
         [this, &obj, fn, &result, &args...]<std::size_t... Is>(std::index_sequence<Is...>) {
-            ((result == error::task_not_registered
+            ((result.err == error::task_not_registered
                   ? (try_trigger_instance<Is>(obj, fn, result, std::forward<Args>(args)...), 0)
                   : 0),
              ...);
@@ -590,14 +661,14 @@ public:
     /// Non-blocking variant: returns error::capacity_exceeded if the
     /// scratchpad pool is full, rather than suspending the caller.
     template <auto Fn, typename... Args>
-    error try_trigger(Args&&... args) {
+    task_handle try_trigger(Args&&... args) {
         constexpr auto idx = slot_index<Fn>();
         using entry_t = typename detail::type_at<idx, Entries...>::type;
 
         if constexpr (entry_t::is_scratchpad) {
             return try_scratchpad(idx);
         } else {
-            return trigger_reserved<idx>(std::forward<Args>(args)...);
+            return task_handle{this, idx, trigger_reserved<idx>(std::forward<Args>(args)...)};
         }
     }
 
@@ -820,17 +891,7 @@ public:
         for (std::size_t i = 0; i < num_tasks; ++i) {
             auto& meta = tasks_[i];
             if (meta.occupied && meta.handle && meta.handle.done()) {
-                if (meta.is_scratchpad && meta.scratch_offset != scratch_unused) {
-                    scratchpad_free(meta.scratch_offset, meta.size);
-                    meta.scratch_offset = scratch_unused;
-                    meta.handle = {};
-                }
-                log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
-                    "INF", fn_names_[i], "completed");
-                meta.occupied = false;
-
-                // A scratchpad task freed pool space — try to resume a waiter.
-                if (meta.is_scratchpad) try_resume_waiter();
+                complete_task(i);
             }
         }
 
@@ -845,15 +906,7 @@ public:
                 if (!has_timer) {
                     meta.handle.resume();
                     if (meta.handle.done()) {
-                        if (meta.is_scratchpad && meta.scratch_offset != scratch_unused) {
-                            scratchpad_free(meta.scratch_offset, meta.size);
-                            meta.scratch_offset = scratch_unused;
-                            meta.handle = {};
-                        }
-                        log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
-                            "INF", fn_names_[i], "completed");
-                        meta.occupied = false;
-                        if (meta.is_scratchpad) try_resume_waiter();
+                        complete_task(i);
                     }
                 }
             }
@@ -883,16 +936,7 @@ public:
             h.resume();
             if (h.done()) {
                 if (task_idx < num_tasks) {
-                    auto& meta = tasks_[task_idx];
-                    if (meta.is_scratchpad && meta.scratch_offset != scratch_unused) {
-                        scratchpad_free(meta.scratch_offset, meta.size);
-                        meta.scratch_offset = scratch_unused;
-                        meta.handle = {};
-                    }
-                    log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
-                        "INF", fn_names_[task_idx], "completed");
-                    tasks_[task_idx].occupied = false;
-                    if (meta.is_scratchpad) try_resume_waiter();
+                    complete_task(task_idx);
                 }
             }
         }

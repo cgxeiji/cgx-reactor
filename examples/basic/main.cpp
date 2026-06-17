@@ -81,19 +81,19 @@ int main() {
 
     // --- Consumer task ---
     {
-        auto ec = eng.template trigger<&consumer_task>();
-        if (ec != cgx::reactor::error::ok) {
+        auto h = eng.template trigger<&consumer_task>();
+        if (h.error() != cgx::reactor::error::ok) {
             std::fprintf(stderr, "consumer trigger failed: %s\n",
-                         cgx::reactor::to_string(ec).data());
+                         cgx::reactor::to_string(h.error()).data());
             return EXIT_FAILURE;
         }
     }
 
     {
-        auto ec = eng.template trigger<&consumer2_task>();
-        if (ec != cgx::reactor::error::ok) {
+        auto h = eng.template trigger<&consumer2_task>();
+        if (h.error() != cgx::reactor::error::ok) {
             std::fprintf(stderr, "consumer2 trigger failed: %s\n",
-                         cgx::reactor::to_string(ec).data());
+                         cgx::reactor::to_string(h.error()).data());
             return EXIT_FAILURE;
         }
     }
@@ -101,20 +101,20 @@ int main() {
     // --- Producer task ---
     std::uint8_t value = 1;
     {
-        auto ec = eng.template trigger<&producer_task>(value);
-        if (ec != cgx::reactor::error::ok) {
+        auto h = eng.template trigger<&producer_task>(value);
+        if (h.error() != cgx::reactor::error::ok) {
             std::fprintf(stderr, "producer trigger failed: %s\n",
-                         cgx::reactor::to_string(ec).data());
+                         cgx::reactor::to_string(h.error()).data());
             return EXIT_FAILURE;
         }
     }
 
     // --- Fire-and-return task ---
     {
-        auto ec = eng.template trigger<&hello_task>();
-        if (ec != cgx::reactor::error::ok) {
+        auto h = eng.template trigger<&hello_task>();
+        if (h.error() != cgx::reactor::error::ok) {
             std::fprintf(stderr, "hello trigger failed: %s\n",
-                         cgx::reactor::to_string(ec).data());
+                         cgx::reactor::to_string(h.error()).data());
             return EXIT_FAILURE;
         }
     }

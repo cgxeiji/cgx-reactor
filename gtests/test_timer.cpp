@@ -27,8 +27,8 @@ TEST(TimerTest, SuspendUntilExpiry) {
         register_task<&delayed_increment>());
 
     // Trigger the task (suspends at delay_ms).
-    auto ec = eng.template trigger<&delayed_increment>(counter);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&delayed_increment>(counter);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(counter, 0);  // Not incremented yet.
 
     // Advance clock by 50ms — not enough.
@@ -67,11 +67,11 @@ TEST(TimerTest, TwoTasksDifferentDelays) {
         register_task<&first_task>(),
         register_task<&second_task>());
 
-    auto ec1 = eng.template trigger<&first_task>(order, first_done);
-    ASSERT_EQ(ec1, error::ok);
+    auto h1 = eng.template trigger<&first_task>(order, first_done);
+    ASSERT_EQ(h1.error(), error::ok);
 
-    auto ec2 = eng.template trigger<&second_task>(order, second_done);
-    ASSERT_EQ(ec2, error::ok);
+    auto h2 = eng.template trigger<&second_task>(order, second_done);
+    ASSERT_EQ(h2.error(), error::ok);
 
     // Advance 100ms → first task should fire.
     test::mock_clock::advance(100ms);
@@ -121,8 +121,8 @@ TEST(TimerTest, PeriodicTaskFiveIterations) {
     auto eng = make_engine<default_config, test::mock_clock>(
         register_task<&periodic_counter>());
 
-    auto ec = eng.template trigger<&periodic_counter>(count);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&periodic_counter>(count);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(count, 0);
 
     // Run 5 iterations: each advances by 50ms then ticks.
@@ -154,8 +154,8 @@ TEST(DelayUntilTest, WakeAtExactTime) {
 
     auto target = test::mock_clock::now() + 100ms;
 
-    auto ec = eng.template trigger<&wake_at_exact_time<test::mock_clock>>(counter, target);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&wake_at_exact_time<test::mock_clock>>(counter, target);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(counter, 0);
 
     // Advance clock to 99ms — not woken yet.
@@ -181,8 +181,8 @@ TEST(DelayUntilTest, PastTimePoint) {
     // Target is 100ms in the past.
     auto target = test::mock_clock::now() - 100ms;
 
-    auto ec = eng.template trigger<&wake_at_exact_time<test::mock_clock>>(counter, target);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&wake_at_exact_time<test::mock_clock>>(counter, target);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(counter, 0);
 
     // Even with a past target, the coroutine is suspended; tick should expire it.
@@ -212,8 +212,8 @@ TEST(DelayUntilTest, QueueFull) {
 
     // delay_until should fail.
     error err = error::ok;
-    auto ec = eng.template trigger<&delay_until_task>(err, test::mock_clock::now() + 10ms);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&delay_until_task>(err, test::mock_clock::now() + 10ms);
+    ASSERT_EQ(h.error(), error::ok);
     eng.tick();
     EXPECT_EQ(err, error::capacity_exceeded);
 }
@@ -242,8 +242,8 @@ TEST(DelayQuantizedTest, GridAlignment) {
     // Start at t=50ms.
     test::mock_clock::set(test::mock_clock::time_point{50ms});
 
-    auto ec = eng.template trigger<&quantized_wake<test::mock_clock>>(counter, 100ms, wake_at);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&quantized_wake<test::mock_clock>>(counter, 100ms, wake_at);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(counter, 0);
 
     // Advance to 100ms — should fire.
@@ -273,8 +273,8 @@ TEST(DelayQuantizedTest, DriftFreePeriodic) {
     // Set epoch to t=0.
     test::mock_clock::set(test::mock_clock::time_point{});
 
-    auto ec = eng.template trigger<&quantized_periodic>(count, 100ms);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&quantized_periodic>(count, 100ms);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(count, 0);
 
     // Advance to t=50ms, tick — task still suspended (next tick at 100ms).
@@ -316,8 +316,8 @@ TEST(DelayQuantizedTest, ExactTickBoundary) {
     // Start on a tick boundary (t=100ms).
     test::mock_clock::set(test::mock_clock::time_point{100ms});
 
-    auto ec = eng.template trigger<&quantized_wake<test::mock_clock>>(counter, 100ms, wake_at);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&quantized_wake<test::mock_clock>>(counter, 100ms, wake_at);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(counter, 0);
 
     // Tick at exactly 100ms — should NOT fire yet (next tick is 200ms).
@@ -353,8 +353,8 @@ TEST(DelayQuantizedTest, QueueFull) {
 
     // Trigger the quantized task — delay_quantized in await_suspend will fail.
     error err = error::ok;
-    auto ec = eng.template trigger<&quantized_error_task>(err, 100ms);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&quantized_error_task>(err, 100ms);
+    ASSERT_EQ(h.error(), error::ok);
 
     // Task completed synchronously (await_suspend returned false), err is set.
     EXPECT_EQ(err, error::capacity_exceeded);

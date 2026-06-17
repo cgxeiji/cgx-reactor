@@ -88,8 +88,8 @@ TEST(InstanceTriggerTest, SingleInstanceSingleMethod) {
     auto eng = make_engine<default_config, test::mock_clock>(
         register_instance(drv));
 
-    auto ec = eng.trigger(drv, &test_driver::init);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.trigger(drv, &test_driver::init);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(drv.counter(), 1);
 }
 
@@ -100,13 +100,13 @@ TEST(InstanceTriggerTest, SingleInstanceMultipleMethods) {
         register_instance(drv));
 
     // Trigger init — fire and return
-    auto ec = eng.trigger(drv, &test_driver::init);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.trigger(drv, &test_driver::init);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(drv.counter(), 1);
 
     // Trigger loop — suspend on first co_await
-    ec = eng.trigger(drv, &test_driver::loop);
-    ASSERT_EQ(ec, error::ok);
+    h = eng.trigger(drv, &test_driver::loop);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(drv.counter(), 1);  // not incremented yet (suspended at entry)
 
     // Tick — loop resumes, counter increments
@@ -114,8 +114,8 @@ TEST(InstanceTriggerTest, SingleInstanceMultipleMethods) {
     EXPECT_EQ(drv.counter(), 2);
 
     // Fire once
-    ec = eng.trigger(drv, &test_driver::fire_once, 42);
-    ASSERT_EQ(ec, error::ok);
+    h = eng.trigger(drv, &test_driver::fire_once, 42);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(drv.recorded(), 42);
 }
 
@@ -128,20 +128,20 @@ TEST(InstanceTriggerTest, TwoInstancesSameClass) {
         register_instance(drv_b));
 
     // Trigger init on drv_a
-    auto ec = eng.trigger(drv_a, &test_driver::init);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.trigger(drv_a, &test_driver::init);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(drv_a.counter(), 1);
     EXPECT_EQ(drv_b.counter(), 0);
 
     // Trigger init on drv_b
-    ec = eng.trigger(drv_b, &test_driver::init);
-    ASSERT_EQ(ec, error::ok);
+    h = eng.trigger(drv_b, &test_driver::init);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(drv_a.counter(), 1);
     EXPECT_EQ(drv_b.counter(), 1);
 
     // Trigger loop on drv_a
-    ec = eng.trigger(drv_a, &test_driver::loop);
-    ASSERT_EQ(ec, error::ok);
+    h = eng.trigger(drv_a, &test_driver::loop);
+    ASSERT_EQ(h.error(), error::ok);
 
     // Tick — only drv_a's loop advances
     eng.tick();
@@ -149,8 +149,8 @@ TEST(InstanceTriggerTest, TwoInstancesSameClass) {
     EXPECT_EQ(drv_b.counter(), 1);  // just init
 
     // Trigger loop on drv_b
-    ec = eng.trigger(drv_b, &test_driver::loop);
-    ASSERT_EQ(ec, error::ok);
+    h = eng.trigger(drv_b, &test_driver::loop);
+    ASSERT_EQ(h.error(), error::ok);
 
     // Tick — both advance
     eng.tick();
@@ -166,12 +166,12 @@ TEST(InstanceTriggerTest, InstanceNotRegistered) {
         register_instance(drv_registered));
 
     // Trigger on an unregistered instance
-    auto ec = eng.trigger(drv_unregistered, &test_driver::init);
-    ASSERT_EQ(ec, error::task_not_registered);
+    auto h = eng.trigger(drv_unregistered, &test_driver::init);
+    ASSERT_EQ(h.error(), error::task_not_registered);
 
     // Registered instance still works
-    ec = eng.trigger(drv_registered, &test_driver::init);
-    ASSERT_EQ(ec, error::ok);
+    h = eng.trigger(drv_registered, &test_driver::init);
+    ASSERT_EQ(h.error(), error::ok);
 }
 
 TEST(InstanceTriggerTest, AlreadyRunning) {
@@ -181,20 +181,20 @@ TEST(InstanceTriggerTest, AlreadyRunning) {
         register_instance(drv));
 
     // Trigger the loop task
-    auto ec = eng.trigger(drv, &test_driver::loop);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.trigger(drv, &test_driver::loop);
+    ASSERT_EQ(h.error(), error::ok);
 
     // Second trigger while running
-    ec = eng.trigger(drv, &test_driver::loop);
-    ASSERT_EQ(ec, error::task_already_running);
+    h = eng.trigger(drv, &test_driver::loop);
+    ASSERT_EQ(h.error(), error::task_already_running);
 
     // Tick — loop advances
     eng.tick();
     EXPECT_EQ(drv.counter(), 1);
 
     // Still running
-    ec = eng.trigger(drv, &test_driver::loop);
-    ASSERT_EQ(ec, error::task_already_running);
+    h = eng.trigger(drv, &test_driver::loop);
+    ASSERT_EQ(h.error(), error::task_already_running);
 }
 
 TEST(InstanceTriggerTest, FreeFunctionStillWorks) {
@@ -203,8 +203,8 @@ TEST(InstanceTriggerTest, FreeFunctionStillWorks) {
     auto eng = make_engine<default_config, test::mock_clock>(
         register_task<&free_inc>());
 
-    auto ec = eng.template trigger<&free_inc>(cnt);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&free_inc>(cnt);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(cnt, 1);
 }
 
@@ -217,18 +217,18 @@ TEST(InstanceTriggerTest, FreeFunctionAndInstanceTogether) {
         register_instance(drv));
 
     // Free function
-    auto ec = eng.template trigger<&free_inc>(cnt);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.template trigger<&free_inc>(cnt);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(cnt, 1);
 
     // Instance-based
-    ec = eng.trigger(drv, &test_driver::init);
-    ASSERT_EQ(ec, error::ok);
+    h = eng.trigger(drv, &test_driver::init);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(drv.counter(), 1);
 
     // Legacy NTTP trigger on instance
-    ec = eng.template trigger<&test_driver::init>();
-    ASSERT_EQ(ec, error::ok);
+    h = eng.template trigger<&test_driver::init>();
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(drv.counter(), 2);
 }
 
@@ -377,13 +377,13 @@ TEST(InstanceTriggerTest, ConstMemberFunction) {
         register_instance(drv));
 
     // Non-const method
-    auto ec = eng.trigger(drv, &const_driver::set_val, 42);
-    ASSERT_EQ(ec, error::ok);
+    auto h = eng.trigger(drv, &const_driver::set_val, 42);
+    ASSERT_EQ(h.error(), error::ok);
     EXPECT_EQ(drv.val(), 42);
 
     // Const method
-    ec = eng.trigger(drv, &const_driver::get_val);
-    ASSERT_EQ(ec, error::ok);
+    h = eng.trigger(drv, &const_driver::get_val);
+    ASSERT_EQ(h.error(), error::ok);
 }
 
 // -----------------------------------------------------------------------
@@ -533,15 +533,15 @@ TEST(InstanceTriggerTest, PoolOversizeReturnsError) {
     EXPECT_TRUE(eng.pool_exhausted());
 
     // All triggers should return capacity_exceeded
-    auto ec = eng.template trigger<&test_driver::init>();
-    ASSERT_EQ(ec, error::capacity_exceeded);
+    auto h = eng.template trigger<&test_driver::init>();
+    ASSERT_EQ(h.error(), error::capacity_exceeded);
 
-    ec = eng.template trigger<&test_driver::loop>();
-    ASSERT_EQ(ec, error::capacity_exceeded);
+    h = eng.template trigger<&test_driver::loop>();
+    ASSERT_EQ(h.error(), error::capacity_exceeded);
 
     // Instance-based trigger should also fail
-    ec = eng.trigger(drv, &test_driver::init);
-    ASSERT_EQ(ec, error::capacity_exceeded);
+    h = eng.trigger(drv, &test_driver::init);
+    ASSERT_EQ(h.error(), error::capacity_exceeded);
 }
 
 }  // anonymous namespace

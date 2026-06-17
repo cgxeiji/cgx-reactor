@@ -6,7 +6,6 @@
 #include <thread>
 
 using namespace std::chrono_literals;
-using cgx::reactor::operator""_tag;
 
 // -----------------------------------------------------------------------
 // drifty_task — uses delay_ms(100ms), drift accumulates
@@ -69,9 +68,9 @@ int main() {
     auto eng = cgx::reactor::make_engine<
         cgx::reactor::default_config,
         cgx::reactor::steady_clock>(
-        cgx::reactor::register_task<"DRFT"_tag, &drifty_task>(),
-        cgx::reactor::register_task<"PRCS"_tag, &precise_task>(),
-        cgx::reactor::register_task<"QNTZ"_tag, &quantized_task>());
+        cgx::reactor::register_task<&drifty_task>(),
+        cgx::reactor::register_task<&precise_task>(),
+        cgx::reactor::register_task<&quantized_task>());
 
     // Trigger all three tasks.
     {

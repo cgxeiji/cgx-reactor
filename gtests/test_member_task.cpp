@@ -62,7 +62,7 @@ TEST(MemberTaskTest, TriggerMemberFunctionFireAndReturn) {
     fake_driver drv;
 
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_instance<"TST1"_tag>(drv));
+        register_instance(drv));
 
     // Trigger the fire-and-return member function.
     auto ec = eng.template trigger<&fake_driver::fire_once>(42);
@@ -77,7 +77,7 @@ TEST(MemberTaskTest, TriggerMemberFunctionLoopAndIncrement) {
     fake_driver drv;
 
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_instance<"TST1"_tag>(drv));
+        register_instance(drv));
 
     // Trigger the infinite-loop member function.
     auto ec = eng.template trigger<&fake_driver::run_loop>();
@@ -99,7 +99,7 @@ TEST(MemberTaskTest, AlreadyRunningForMemberFn) {
     fake_driver drv;
 
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_instance<"TST1"_tag>(drv));
+        register_instance(drv));
 
     // Trigger the loop — it suspends immediately.
     auto ec = eng.template trigger<&fake_driver::run_loop>();
@@ -122,10 +122,10 @@ TEST(MemberTaskTest, TwoInstancesWithDifferentTags) {
     fake_driver drv_a;
     fake_driver drv_b;
 
-    // Register two instances with different tags.
+    // Register two instances.
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_instance<"DRVA"_tag>(drv_a),
-        register_instance<"DRVB"_tag>(drv_b));
+        register_instance(drv_a),
+        register_instance(drv_b));
 
     // Trigger run_loop on drv_a (first match wins with slot_index).
     auto ec = eng.template trigger<&fake_driver::run_loop>();
@@ -146,8 +146,8 @@ TEST(MemberTaskTest, FreeFunctionAndMemberTaskTogether) {
     int free_cnt = 0;
 
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"FREE"_tag, &free_inc>(),
-        register_instance<"TST1"_tag>(drv));
+        register_task<&free_inc>(),
+        register_instance(drv));
 
     // Trigger the free function task.
     auto ec = eng.template trigger<&free_inc>(free_cnt);

@@ -24,7 +24,7 @@ task delayed_increment(int& counter) {
 TEST(TimerTest, SuspendUntilExpiry) {
     int counter = 0;
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"DELY"_tag, &delayed_increment>());
+        register_task<&delayed_increment>());
 
     // Trigger the task (suspends at delay_ms).
     auto ec = eng.template trigger<&delayed_increment>(counter);
@@ -64,8 +64,8 @@ TEST(TimerTest, TwoTasksDifferentDelays) {
     int second_done = 0;
 
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"FIRST"_tag, &first_task>(),
-        register_task<"SCND"_tag, &second_task>());
+        register_task<&first_task>(),
+        register_task<&second_task>());
 
     auto ec1 = eng.template trigger<&first_task>(order, first_done);
     ASSERT_EQ(ec1, error::ok);
@@ -119,7 +119,7 @@ task periodic_counter(int& count) {
 TEST(TimerTest, PeriodicTaskFiveIterations) {
     int count = 0;
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"PERI"_tag, &periodic_counter>());
+        register_task<&periodic_counter>());
 
     auto ec = eng.template trigger<&periodic_counter>(count);
     ASSERT_EQ(ec, error::ok);
@@ -150,7 +150,7 @@ task wake_at_exact_time(int& counter, cgx::reactor::test::mock_clock::time_point
 TEST(DelayUntilTest, WakeAtExactTime) {
     int counter = 0;
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"EXCT"_tag, &wake_at_exact_time<test::mock_clock>>());
+        register_task<&wake_at_exact_time<test::mock_clock>>());
 
     auto target = test::mock_clock::now() + 100ms;
 
@@ -176,7 +176,7 @@ TEST(DelayUntilTest, WakeAtExactTime) {
 TEST(DelayUntilTest, PastTimePoint) {
     int counter = 0;
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"PAST"_tag, &wake_at_exact_time<test::mock_clock>>());
+        register_task<&wake_at_exact_time<test::mock_clock>>());
 
     // Target is 100ms in the past.
     auto target = test::mock_clock::now() - 100ms;
@@ -201,7 +201,7 @@ task delay_until_task(error& out_err, test::mock_clock::time_point target) {
 
 TEST(DelayUntilTest, QueueFull) {
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"DUQF"_tag, &delay_until_task>());
+        register_task<&delay_until_task>());
 
     // Fill the timer queue.
     auto far = test::mock_clock::now() + 1h;
@@ -237,7 +237,7 @@ TEST(DelayQuantizedTest, GridAlignment) {
     int counter = 0;
     auto wake_at = test::mock_clock::time_point{};
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"GRID"_tag, &quantized_wake<test::mock_clock>>());
+        register_task<&quantized_wake<test::mock_clock>>());
 
     // Start at t=50ms.
     test::mock_clock::set(test::mock_clock::time_point{50ms});
@@ -268,7 +268,7 @@ task quantized_periodic(int& count, test::mock_clock::duration interval) {
 TEST(DelayQuantizedTest, DriftFreePeriodic) {
     int count = 0;
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"DRFT"_tag, &quantized_periodic>());
+        register_task<&quantized_periodic>());
 
     // Set epoch to t=0.
     test::mock_clock::set(test::mock_clock::time_point{});
@@ -311,7 +311,7 @@ TEST(DelayQuantizedTest, ExactTickBoundary) {
     int counter = 0;
     auto wake_at = test::mock_clock::time_point{};
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"TICK"_tag, &quantized_wake<test::mock_clock>>());
+        register_task<&quantized_wake<test::mock_clock>>());
 
     // Start on a tick boundary (t=100ms).
     test::mock_clock::set(test::mock_clock::time_point{100ms});
@@ -342,7 +342,7 @@ task quantized_error_task(error& out_err, test::mock_clock::duration interval) {
 
 TEST(DelayQuantizedTest, QueueFull) {
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"DQQF"_tag, &quantized_error_task>());
+        register_task<&quantized_error_task>());
 
     // Fill the timer queue.
     auto far = test::mock_clock::now() + 1h;

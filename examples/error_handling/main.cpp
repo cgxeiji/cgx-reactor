@@ -125,19 +125,19 @@ task any_coroutine() {
 
 // ---------------------------------------------------------------------------
 // Main
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
 
 int main() {
     std::cout << "=== Error Handling Example ===\n\n";
 
     auto eng = make_engine<small_config, steady_clock>(
-        register_task<"LONG"_tag, &long_running_task>(),
-        register_task<"TMA_"_tag, &timer_task_a>(),
-        register_task<"TMB_"_tag, &timer_task_b>(),
-        register_task<"TMC_"_tag, &timer_task_c>(),
-        register_task<"LST1"_tag, &listener_task_1>(),
-        register_task<"LST2"_tag, &listener_task_2>(),
-        register_task<"LST3"_tag, &listener_task_3>());
+        register_task<&long_running_task>(),
+        register_task<&timer_task_a>(),
+        register_task<&timer_task_b>(),
+        register_task<&timer_task_c>(),
+        register_task<&listener_task_1>(),
+        register_task<&listener_task_2>(),
+        register_task<&listener_task_3>());
 
     // Error 1: task_already_running
     std::cout << "--- Error 1: task_already_running ---\n";
@@ -177,7 +177,7 @@ int main() {
     std::cout << "--- Error 4: pool overflow ---\n";
     {
         auto tiny_eng = make_engine<tiny_pool_config, steady_clock>(
-            register_task<"OVER"_tag, &any_coroutine>());
+            register_task<&any_coroutine>());
 
         std::cout << "pool_exhausted(): " << (tiny_eng.pool_exhausted() ? "true" : "false") << "\n";
         ec = tiny_eng.template trigger<&any_coroutine>();

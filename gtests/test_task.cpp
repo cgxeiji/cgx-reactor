@@ -42,7 +42,7 @@ task infinite_loop(int& counter) {
 TEST(TaskTest, FireAndReturn) {
     int counter = 0;
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"INC_"_tag, &increment_counter>());
+        register_task<&increment_counter>());
 
     auto ec = eng.template trigger<&increment_counter>(counter);
     ASSERT_EQ(ec, error::ok);
@@ -53,7 +53,7 @@ TEST(TaskTest, FireAndReturn) {
 TEST(TaskTest, TriggerTickAndReTrigger) {
     int counter = 0;
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"INCR"_tag, &increment_after_suspend>());
+        register_task<&increment_after_suspend>());
 
     // First trigger -- suspends at first co_await.
     auto ec = eng.template trigger<&increment_after_suspend>(counter);
@@ -76,7 +76,7 @@ TEST(TaskTest, TriggerTickAndReTrigger) {
 TEST(TaskTest, AlreadyRunning) {
     int counter = 0;
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"LOOP"_tag, &infinite_loop>());
+        register_task<&infinite_loop>());
 
     // First trigger -- suspends at first co_await.
     auto ec = eng.template trigger<&infinite_loop>(counter);
@@ -98,7 +98,7 @@ TEST(TaskTest, AlreadyRunning) {
 TEST(TaskTest, EngineSizeIsValidConstant) {
     // Verify that the engine type is complete and has a known size.
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"INC_"_tag, &increment_counter>());
+        register_task<&increment_counter>());
     static_assert(
         sizeof(eng) > 0,
         "engine must be a complete type");

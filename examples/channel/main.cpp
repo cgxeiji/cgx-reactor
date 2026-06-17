@@ -5,7 +5,6 @@
 #include <cstring>
 
 namespace cr = cgx::reactor;
-using cr::operator""_tag;
 
 using namespace std::chrono_literals;
 
@@ -134,8 +133,8 @@ int main() {
     processor proc;
 
     auto eng = cr::make_engine<cr::default_config, cr::steady_clock>(
-        cr::register_instance<"UARX"_tag>(rx),
-        cr::register_instance<"PROC"_tag>(proc));
+        cr::register_instance(rx),
+        cr::register_instance(proc));
 
     // Start processor tasks first
     auto ec = eng.template trigger<&processor::fast_buffer>(rx);

@@ -3,7 +3,6 @@
 #include <thread>
 
 namespace cr = cgx::reactor;
-using cr::operator""_tag;
 
 // ---------------------------------------------------------------------------
 // Custom logger — prints to stdout
@@ -95,12 +94,12 @@ int main() {
 
     auto eng = cr::make_engine<cr::default_config, cr::steady_clock,
                                stdout_logger>(
-        cr::register_task<"FIRE"_tag, &delayed_increment>(),
-        cr::register_task<"LOOP"_tag, &periodic_loop>(),
-        cr::register_task<"SIGF"_tag, &signal_firer>(),
-        cr::register_task<"SIGL"_tag, &signal_listener>(),
-        cr::register_task<"CHNP"_tag, &channel_producer>(),
-        cr::register_task<"CHNC"_tag, &channel_consumer>());
+        cr::register_task<&delayed_increment>(),
+        cr::register_task<&periodic_loop>(),
+        cr::register_task<&signal_firer>(),
+        cr::register_task<&signal_listener>(),
+        cr::register_task<&channel_producer>(),
+        cr::register_task<&channel_consumer>());
 
     std::puts("=== cgx::reactor logging example ===\n");
     std::puts("--- triggering all tasks ---");

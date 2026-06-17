@@ -5,7 +5,6 @@
 #include <cstdlib>
 
 namespace cr = cgx::reactor;
-using cr::operator""_tag;
 
 using namespace std::chrono_literals;
 
@@ -72,11 +71,11 @@ int main() {
     mock_temperature_sensor sensor_b{30.0f, 3.0f};
     serial_printer         printer;
 
-    // Register all three with named tags (explicit per-instance registration).
+    // Register all three instances.
     auto eng = cr::make_engine<cr::default_config, cr::steady_clock>(
-        cr::register_instance<"SA"_tag>(sensor_a),
-        cr::register_instance<"SB"_tag>(sensor_b),
-        cr::register_instance<"PRN"_tag>(printer));
+        cr::register_instance(sensor_a),
+        cr::register_instance(sensor_b),
+        cr::register_instance(printer));
 
     // Trigger each sensor by instance (instance-based dispatch).
     auto ec = eng.trigger(sensor_a, &mock_temperature_sensor::poll_loop);

@@ -86,7 +86,7 @@ TEST(InstanceTriggerTest, SingleInstanceSingleMethod) {
     test_driver drv;
 
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_instance(drv));  // no tag — auto-generate
+        register_instance(drv));
 
     auto ec = eng.trigger(drv, &test_driver::init);
     ASSERT_EQ(ec, error::ok);
@@ -124,8 +124,8 @@ TEST(InstanceTriggerTest, TwoInstancesSameClass) {
     test_driver drv_b;
 
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_instance<"A"_tag>(drv_a),
-        register_instance<"B"_tag>(drv_b));
+        register_instance(drv_a),
+        register_instance(drv_b));
 
     // Trigger init on drv_a
     auto ec = eng.trigger(drv_a, &test_driver::init);
@@ -163,7 +163,7 @@ TEST(InstanceTriggerTest, InstanceNotRegistered) {
     test_driver drv_unregistered;
 
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_instance<"R"_tag>(drv_registered));
+        register_instance(drv_registered));
 
     // Trigger on an unregistered instance
     auto ec = eng.trigger(drv_unregistered, &test_driver::init);
@@ -213,8 +213,8 @@ TEST(InstanceTriggerTest, FreeFunctionAndInstanceTogether) {
     int cnt = 0;
 
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_task<"FREE"_tag, &free_inc>(),
-        register_instance<"DRV"_tag>(drv));
+        register_task<&free_inc>(),
+        register_instance(drv));
 
     // Free function
     auto ec = eng.template trigger<&free_inc>(cnt);
@@ -251,29 +251,32 @@ TEST(InstanceTriggerTest, DumpWithLoggerContainsTaskInfo) {
     test_driver drv;
 
     auto eng = make_engine<default_config, test::mock_clock, capture_logger>(
-        register_instance<"DRV"_tag>(drv));
+        register_instance(drv));
 
     eng.dump();
 
-    // Should contain task info
+    // Should contain truncated task info (16-byte tag limit)
+    // test_driver::init (17 chars) → ~t_driver::init
+    // test_driver::loop (17 chars) → ~t_driver::loop
+    // test_driver::fire_once (21 chars) → ~ver::fire_once
     ASSERT_GE(capture_logger::lines.size(), 1u);
     bool found_init = false;
     bool found_loop = false;
     bool found_fire_once = false;
     for (const auto& line : capture_logger::lines) {
-        if (line.find("test_driver::init") != std::string::npos) {
+        if (line.find("~t_driver::init") != std::string::npos) {
             found_init = true;
         }
-        if (line.find("test_driver::loop") != std::string::npos) {
+        if (line.find("~t_driver::loop") != std::string::npos) {
             found_loop = true;
         }
-        if (line.find("test_driver::fire_once") != std::string::npos) {
+        if (line.find("~ver::fire_once") != std::string::npos) {
             found_fire_once = true;
         }
     }
-    EXPECT_TRUE(found_init) << "dump should mention test_driver::init";
-    EXPECT_TRUE(found_loop) << "dump should mention test_driver::loop";
-    EXPECT_TRUE(found_fire_once) << "dump should mention test_driver::fire_once";
+    EXPECT_TRUE(found_init) << "dump should mention ~t_driver::init (truncated)";
+    EXPECT_TRUE(found_loop) << "dump should mention ~t_driver::loop (truncated)";
+    EXPECT_TRUE(found_fire_once) << "dump should mention ~ver::fire_once (truncated)";
 }
 
 TEST(InstanceTriggerTest, DumpReturnsCorrectStats) {
@@ -281,7 +284,7 @@ TEST(InstanceTriggerTest, DumpReturnsCorrectStats) {
     test_driver drv;
 
     auto eng = make_engine<default_config, test::mock_clock, capture_logger>(
-        register_instance<"DRV"_tag>(drv));
+        register_instance(drv));
 
     auto r = eng.dump();
     EXPECT_EQ(r.task_count, 3u);
@@ -296,7 +299,7 @@ TEST(InstanceTriggerTest, DumpWithCustomSink) {
     test_driver drv;
 
     auto eng = make_engine<default_config, test::mock_clock>(
-        register_instance(drv));  // auto-tag
+        register_instance(drv));
 
     auto r = eng.dump([&sink_lines](std::string_view line) {
         sink_lines.push_back(std::string(line));
@@ -338,24 +341,21 @@ TEST(InstanceTriggerTest, AutoTagShowsInDump) {
     capture_logger::lines.clear();
     test_driver drv;
 
-    // No tag — auto-generate TSK0, TSK1, TSK2
     auto eng = make_engine<default_config, test::mock_clock, capture_logger>(
         register_instance(drv));
 
     eng.dump();
 
-    // Output should contain the auto-generated tag suffix (TSK0 etc.)
+    // Output should contain truncated function name (~t_driver::init)
     ASSERT_GE(capture_logger::lines.size(), 3u);
-    // The dump output strips the "reactor::task::" prefix, so we should see
-    // "TSK0" not "reactor::task::TSK0"
-    bool found_tsk0 = false;
+    bool found_init = false;
     for (const auto& line : capture_logger::lines) {
-        if (line.find("TSK0") != std::string::npos) {
-            found_tsk0 = true;
+        if (line.find("~t_driver::init") != std::string::npos) {
+            found_init = true;
             break;
         }
     }
-    EXPECT_TRUE(found_tsk0) << "dump should contain auto-generated TSK0 tag";
+    EXPECT_TRUE(found_init) << "dump should contain ~t_driver::init (truncated)";
 }
 
 // -----------------------------------------------------------------------
@@ -461,7 +461,8 @@ TEST(InstanceTriggerTest, FrameProbingCapturesNoArgTasks) {
 
     // Per-task lines start at index 2 (after reserved + scratchpad summaries)
     // init (index 2): no-arg member, should be probed (small, <= 64B)
-    EXPECT_NE(sink_lines[2].find("test_driver::init"), std::string::npos);
+    // Truncated: test_driver::init → ~t_driver::init
+    EXPECT_NE(sink_lines[2].find("~t_driver::init"), std::string::npos);
     EXPECT_TRUE(sink_lines[2].find("size=") != std::string::npos)
         << "init missing size=: " << sink_lines[2];
     {
@@ -474,7 +475,8 @@ TEST(InstanceTriggerTest, FrameProbingCapturesNoArgTasks) {
     }
 
     // loop (index 3): no-arg member, should be probed (small, <= 64B)
-    EXPECT_NE(sink_lines[3].find("test_driver::loop"), std::string::npos);
+    // Truncated: test_driver::loop → ~t_driver::loop
+    EXPECT_NE(sink_lines[3].find("~t_driver::loop"), std::string::npos);
     {
         auto pos = sink_lines[3].find("size=") + 5;
         auto end = sink_lines[3].find('B', pos);
@@ -484,7 +486,8 @@ TEST(InstanceTriggerTest, FrameProbingCapturesNoArgTasks) {
     }
 
     // fire_once (index 4): takes int param, NOT probed, gets fallback 1024B
-    EXPECT_NE(sink_lines[4].find("test_driver::fire_once"), std::string::npos);
+    // Truncated: test_driver::fire_once → ~ver::fire_once
+    EXPECT_NE(sink_lines[4].find("~ver::fire_once"), std::string::npos);
     EXPECT_NE(sink_lines[4].find("size=1024B"), std::string::npos)
         << "fire_once should get fallback: " << sink_lines[4];
 }

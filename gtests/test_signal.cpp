@@ -11,10 +11,8 @@ namespace {
 // POSIX `<sys/signal.h>` (pulled in indirectly via <coroutine> or other
 // standard headers) declares `signal()` in the global namespace, which
 // clashes with `cgx::reactor::signal`.  Instead we use a short alias
-// for types/values and a separate `using` declaration for the tag UDL
-// (UDLs cannot be reached via a namespace alias).
+// for types/values.
 namespace cr = cgx::reactor;
-using cgx::reactor::operator""_tag;
 
 using namespace std::chrono_literals;
 
@@ -90,7 +88,7 @@ TEST(SignalTest, SingleListener) {
     int result = 0;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"ONE_"_tag, &one_shot_listener>());
+        cr::register_task<&one_shot_listener>());
 
     auto ec = eng.template trigger<&one_shot_listener>(sig, result);
     ASSERT_EQ(ec, cr::error::ok);
@@ -114,7 +112,7 @@ TEST(SignalTest, ListenThroughConstRef) {
     int result = 0;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"CNST"_tag, &const_listener>());
+        cr::register_task<&const_listener>());
 
     auto ec = eng.template trigger<&const_listener>(sig, result);
     ASSERT_EQ(ec, cr::error::ok);
@@ -133,9 +131,9 @@ TEST(SignalTest, ThreeListenersAllReceiveValue) {
     int r1 = 0, r2 = 0, r3 = 0;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"LST1"_tag, &listener_a>(),
-        cr::register_task<"LST2"_tag, &listener_b>(),
-        cr::register_task<"LST3"_tag, &listener_c>());
+        cr::register_task<&listener_a>(),
+        cr::register_task<&listener_b>(),
+        cr::register_task<&listener_c>());
 
     auto ec = eng.template trigger<&listener_a>(sig, r1);
     ASSERT_EQ(ec, cr::error::ok);
@@ -165,7 +163,7 @@ TEST(SignalTest, MultipleCycles) {
     int out1 = 0, out2 = 0;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"TWOC"_tag, &two_cycle_listener>());
+        cr::register_task<&two_cycle_listener>());
 
     auto ec = eng.template trigger<&two_cycle_listener>(sig, out1, out2);
     ASSERT_EQ(ec, cr::error::ok);
@@ -190,8 +188,8 @@ TEST(SignalTest, ListenerLimitExceeded) {
     bool overflow = false;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"FILL"_tag, &filler>(),
-        cr::register_task<"OVER"_tag, &overflow_detector>());
+        cr::register_task<&filler>(),
+        cr::register_task<&overflow_detector>());
 
     // Fill the single listener slot.
     auto ec = eng.template trigger<&filler>(sig);
@@ -237,8 +235,8 @@ TEST(SignalTest, EngineIntegration) {
     int received = 0;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"CNSM"_tag, &consumer>(),
-        cr::register_task<"PROD"_tag, &producer>());
+        cr::register_task<&consumer>(),
+        cr::register_task<&producer>());
 
     // Trigger consumer FIRST so its timer sits at index 0 and will be
     // processed before the producer's timer in tick() step (b).

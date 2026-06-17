@@ -4,7 +4,6 @@
 #include <cstdlib>
 
 using namespace std::chrono_literals;
-using cgx::reactor::operator""_tag;
 
 // -----------------------------------------------------------------------
 // Signal for inter-task data transfer
@@ -71,10 +70,10 @@ int main() {
     auto eng = cgx::reactor::make_engine<
         cgx::reactor::default_config,
         cgx::reactor::steady_clock>(
-        cgx::reactor::register_task<"HELO"_tag, &hello_task>(),
-        cgx::reactor::register_task<"PROD"_tag, &producer_task>(),
-        cgx::reactor::register_task<"CNS1"_tag, &consumer_task>(),
-        cgx::reactor::register_task<"CNS2"_tag, &consumer2_task>());
+        cgx::reactor::register_task<&hello_task>(),
+        cgx::reactor::register_task<&producer_task>(),
+        cgx::reactor::register_task<&consumer_task>(),
+        cgx::reactor::register_task<&consumer2_task>());
 
     // Trigger order matters: consumer FIRST so its timer sits at a lower
     // array index and is processed before the producer's timer in tick().

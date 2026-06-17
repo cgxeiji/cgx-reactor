@@ -8,55 +8,6 @@
 namespace cgx::reactor {
 
 // ---------------------------------------------------------------------------
-// Compile-time tag (variadic chars, null-terminated for string output)
-// ---------------------------------------------------------------------------
-
-/// Compile-time character tag for task identification / debugging.
-template <char... Cs>
-struct tag {
-    static constexpr char value[sizeof...(Cs) + 1] = {Cs..., '\0'};
-    static constexpr std::size_t size = sizeof...(Cs);
-};
-
-template <char... Cs>
-constexpr char tag<Cs...>::value[sizeof...(Cs) + 1];
-
-// ---------------------------------------------------------------------------
-// User-defined literal for tags — `"DISP"_tag` → tag<'D','I','S','P'>
-//
-// This is the C++20 template UDL form (P1040R6).  It is standard, but
-// clang emits a `-Wgnu-string-literal-operator-template` warning because
-// the syntax originated as a GCC extension.  The warning is suppressed
-// locally here so users get clean builds.
-//
-// Usage at the call site requires the operator to be in scope:
-//   using cgx::reactor::operator""_tag;       // (or)
-//   using namespace cgx::reactor;
-// ---------------------------------------------------------------------------
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wgnu-string-literal-operator-template"
-
-template <typename CharT, CharT... Cs>
-constexpr tag<Cs...> operator""_tag() noexcept {
-    return {};
-}
-
-#pragma clang diagnostic pop
-
-// ---------------------------------------------------------------------------
-// make_tag — escape hatch for cases where the tag chars are not a literal
-// (rare; useful in metaprogramming that builds tags from other values).
-// ---------------------------------------------------------------------------
-
-/// Construct a tag from explicit characters.
-/// Usage:  make_tag<'H','E','L','O'>()
-template <char... Cs>
-constexpr tag<Cs...> make_tag() noexcept {
-    return {};
-}
-
-// ---------------------------------------------------------------------------
 // scratch<Fn> — marks a task as scratchpad (one-shot, pool-allocated)
 // ---------------------------------------------------------------------------
 
@@ -82,11 +33,9 @@ struct task_list {};
 // Bound spec — wraps a class instance and its member-function task list
 // ---------------------------------------------------------------------------
 
-template <typename Class_, auto Tag_, auto... MemFns_>
+template <typename Class_, auto... MemFns_>
 struct bound {
     Class_* self;
-    using tag_t = decltype(Tag_);
-    static constexpr auto tag_value = Tag_;
     using class_type = Class_;
     static constexpr std::size_t num_fns = sizeof...(MemFns_);
 };
@@ -95,10 +44,8 @@ struct bound {
 // Free spec — wraps a free function as a task
 // ---------------------------------------------------------------------------
 
-template <auto Tag_, auto Fn_>
+template <auto Fn_>
 struct free_spec {
-    using tag_t = decltype(Tag_);
-    static constexpr auto tag_value = Tag_;
     static constexpr std::size_t num_fns = 1;
 };
 
@@ -113,8 +60,8 @@ struct unwrap_task_list_helper;
 
 template <auto... MemFns>
 struct unwrap_task_list_helper<task_list<MemFns...>> {
-    template <typename Class, auto Tag>
-    using bound_type = bound<Class, Tag, MemFns...>;
+    template <typename Class>
+    using bound_type = bound<Class, MemFns...>;
 };
 
 } // namespace detail
@@ -155,26 +102,19 @@ struct engine_report {
     std::size_t scratchpad_size;
 };
 
-template <auto Tag = tag<>{}, typename Class>
+template <typename Class>
 auto register_instance(Class& obj) {
     return typename detail::unwrap_task_list_helper<
         typename Class::reactor_tasks
-    >::template bound_type<Class, Tag>{&obj};
+    >::template bound_type<Class>{&obj};
 }
 
 // ---------------------------------------------------------------------------
 // register_task — wrap a free function as a free_spec
 // ---------------------------------------------------------------------------
 
-// Single-argument overload: no explicit tag (auto-generate)
 template <auto Fn>
-constexpr free_spec<tag<>{}, Fn> register_task() noexcept {
-    return {};
-}
-
-// Two-argument overload: explicit tag + function pointer
-template <auto Tag, auto Fn>
-constexpr free_spec<Tag, Fn> register_task() noexcept {
+constexpr free_spec<Fn> register_task() noexcept {
     return {};
 }
 
@@ -230,22 +170,20 @@ struct count_slots;
 template <>
 struct count_slots<> : std::integral_constant<std::size_t, 0> {};
 
-template <typename Class, auto Tag, auto... MemFns, typename... Rest>
-struct count_slots<bound<Class, Tag, MemFns...>, Rest...>
+template <typename Class, auto... MemFns, typename... Rest>
+struct count_slots<bound<Class, MemFns...>, Rest...>
     : std::integral_constant<std::size_t,
                              sizeof...(MemFns) + count_slots<Rest...>::value> {};
 
-template <auto Tag, auto Fn, typename... Rest>
-struct count_slots<free_spec<Tag, Fn>, Rest...>
+template <auto Fn, typename... Rest>
+struct count_slots<free_spec<Fn>, Rest...>
     : std::integral_constant<std::size_t, 1 + count_slots<Rest...>::value> {};
 
-// Per-slot descriptor: carries function pointer (NTTP), tag (NTTP), class type,
+// Per-slot descriptor: carries function pointer (NTTP), class type,
 // and a flag indicating whether the task uses the scratchpad pool.
-template <auto Fn_, auto Tag_, typename Class_, bool IsScratchpad_ = false>
+template <auto Fn_, typename Class_, bool IsScratchpad_ = false>
 struct task_descriptor {
     static constexpr auto fn = Fn_;
-    using tag_type = decltype(Tag_);
-    static constexpr auto tag_value = Tag_;
     using class_type = Class_;
     static constexpr bool is_scratchpad = IsScratchpad_;
 };
@@ -259,14 +197,13 @@ struct spec_unfolder<> {
     using type = type_list<>;
 };
 
-template <typename Class, auto Tag, auto... MemFns, typename... Rest>
-struct spec_unfolder<bound<Class, Tag, MemFns...>, Rest...> {
+template <typename Class, auto... MemFns, typename... Rest>
+struct spec_unfolder<bound<Class, MemFns...>, Rest...> {
     using rest = typename spec_unfolder<Rest...>::type;
     
     template <auto MF>
     using normalized_desc = task_descriptor<
         unwrap_entry<MF>(),
-        Tag,
         Class,
         is_scratch_type<decltype(MF)>::value
     >;
@@ -277,11 +214,11 @@ struct spec_unfolder<bound<Class, Tag, MemFns...>, Rest...> {
     >::type;
 };
 
-template <auto Tag, auto Fn, typename... Rest>
-struct spec_unfolder<free_spec<Tag, Fn>, Rest...> {
+template <auto Fn, typename... Rest>
+struct spec_unfolder<free_spec<Fn>, Rest...> {
     using rest = typename spec_unfolder<Rest...>::type;
     using type = typename concat<
-        type_list<task_descriptor<Fn, Tag, void, false>>,
+        type_list<task_descriptor<Fn, void, false>>,
         rest
     >::type;
 };

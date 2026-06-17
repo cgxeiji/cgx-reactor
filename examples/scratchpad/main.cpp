@@ -9,7 +9,6 @@
 
 using namespace std::chrono_literals;
 namespace cr = cgx::reactor;
-using cr::operator""_tag;
 
 // -----------------------------------------------------------------------
 // Config: 2040B scratchpad pool.

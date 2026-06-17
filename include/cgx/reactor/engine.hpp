@@ -36,58 +36,83 @@ struct engine_from_desc_list<Config, Clock, Logger, detail::type_list<Ds...>> {
     using type = engine<Config, Clock, Logger, Ds...>;
 };
 
-// Compile-time concatenation of "reactor::task::" with a task tag.
-// Produces strings like "reactor::task::FLSH" for use in log points.
-template <typename TagType>
-struct prefixed_tag {
-    static constexpr const char prefix[] = "reactor::task::";
-    static constexpr std::size_t prefix_len = sizeof(prefix) - 1;
-    static constexpr auto& suffix = TagType::value;
-    static constexpr std::size_t suffix_len = sizeof(suffix);
-    static constexpr std::size_t total = prefix_len + suffix_len;
+// -------------------------------------------------------------------------
+// compiled_str<N> — constexpr string type for compile-time function names
+// -------------------------------------------------------------------------
 
-    static constexpr auto make() {
-        std::array<char, total> arr{};
-        for (std::size_t i = 0; i < prefix_len; ++i)
-            arr[i] = prefix[i];
-        for (std::size_t i = 0; i < suffix_len; ++i)
-            arr[prefix_len + i] = suffix[i];
-        return arr;
-    }
-
-    static constexpr auto arr = make();
-    static constexpr const char* value = arr.data();
+template <std::size_t N>
+struct compiled_str {
+    char data[N]{};  // N includes null terminator
+    static constexpr std::size_t size = N;  // includes null
+    
+    constexpr operator const char*() const { return data; }
+    constexpr std::string_view view() const { return {data, N - 1}; }
 };
 
-// Length of the "reactor::task::" prefix (used by engine::dump to strip it)
-static constexpr std::size_t log_tag_prefix_len = sizeof("reactor::task::") - 1;
-
 // -------------------------------------------------------------------------
-// Function-name extraction via __PRETTY_FUNCTION__ (clang/GCC)
+// Function-name extraction via __PRETTY_FUNCTION__ (clang/GCC C++20)
 //
-// Returns a pointer to a program-lifetime static buffer.  This is safe for
-// diagnostic dump output — all calls with the same Fn NTTP share the same
-// static, which means two instances of the same class emitting the same
-// method in dump output will get the same pointer (not a problem for dump).
+// Returns a compiled_str<N> at compile time.  Zero heap allocation.
 // -------------------------------------------------------------------------
 
 template <auto Fn>
-static const char* fn_name() {
-    std::string_view pretty = __PRETTY_FUNCTION__;
-    auto prefix = pretty.find("Fn = ");
-    if (prefix == std::string_view::npos) return "unknown";
-    auto start = prefix + 5;
-    auto end = pretty.find(']', start);
-    if (end == std::string_view::npos) return "unknown";
-    auto name = pretty.substr(start, end - start);
-    // Strip leading "&" or "&(" / trailing ")"
-    if (name.starts_with("&(") && name.ends_with(")")) {
-        name = name.substr(2, name.size() - 3);
-    } else if (name.starts_with("&")) {
-        name = name.substr(1);
+constexpr auto extract_fn_name() {
+    constexpr std::string_view pretty = __PRETTY_FUNCTION__;
+    constexpr auto prefix = pretty.find("Fn = ");
+    static_assert(prefix != std::string_view::npos, "Cannot find Fn = in __PRETTY_FUNCTION__");
+    constexpr auto start = prefix + 5;
+    constexpr auto end = pretty.find(']', start);
+    static_assert(end != std::string_view::npos, "Cannot find ] after Fn = ");
+    constexpr auto name = pretty.substr(start, end - start);
+    
+    // Strip "&" or "&(" / ")"
+    if constexpr (name.starts_with("&(") && name.ends_with(")")) {
+        constexpr auto stripped = name.substr(2, name.size() - 3);
+        compiled_str<stripped.size() + 1> result{};
+        for (std::size_t i = 0; i < stripped.size(); ++i)
+            result.data[i] = stripped[i];
+        return result;
+    } else if constexpr (name.starts_with("&")) {
+        constexpr auto stripped = name.substr(1);
+        compiled_str<stripped.size() + 1> result{};
+        for (std::size_t i = 0; i < stripped.size(); ++i)
+            result.data[i] = stripped[i];
+        return result;
+    } else {
+        compiled_str<name.size() + 1> result{};
+        for (std::size_t i = 0; i < name.size(); ++i)
+            result.data[i] = name[i];
+        return result;
     }
-    static std::string result(name);
-    return result.c_str();
+}
+
+// -------------------------------------------------------------------------
+// format_tag<Fn>() — formats tag with truncation, returns const char*
+//
+// 16 bytes total (15 content + 1 null)
+// Short names (≤15 chars): stored as-is
+// Long names (>15 chars): ~ + last 14 chars
+// -------------------------------------------------------------------------
+
+template <auto Fn>
+const char* format_tag() {
+    static constexpr auto name = extract_fn_name<Fn>();
+    static char tag[16]; // 15 bytes content + 1 byte null
+    
+    if constexpr (name.size <= 16) {
+        // Fits: store as-is (name.size includes null)
+        for (std::size_t i = 0; i < name.size; ++i)
+            tag[i] = name.data[i];
+    } else {
+        // Truncate: ~ + last 14 chars
+        // name.size includes null, so content length = name.size - 1
+        // We want last 14 chars of content: start at (name.size - 1) - 14 = name.size - 15
+        tag[0] = '~';
+        for (std::size_t i = 0; i < 14; ++i)
+            tag[i + 1] = name.data[name.size - 15 + i];
+        tag[15] = '\0';
+    }
+    return tag;
 }
 
 /// Fallback frame size for tasks that could not be probed (e.g., tasks
@@ -101,10 +126,8 @@ template <typename Config, typename ClockType, typename Logger, typename... Entr
 class engine {
     static constexpr std::size_t num_tasks = sizeof...(Entries);
 
-    static constexpr std::size_t tag_buf_size = 64;
-
-    std::array<const char*, num_tasks> tag_strings_{};
-    std::array<char[tag_buf_size], num_tasks> auto_tag_bufs_{};
+    // Function name storage (pointers to static constexpr strings)
+    std::array<const char*, num_tasks> fn_names_{};
 
     // Reserved pool.
     alignas(std::max_align_t) std::array<std::byte, Config::reserved_pool_size> pool_{};
@@ -272,23 +295,10 @@ private:
     static constexpr std::size_t num_scratchpad = count_scratchpad_impl(std::make_index_sequence<num_tasks>{});
     static constexpr std::size_t num_reserved = num_tasks - num_scratchpad;
 
-    void init_tag_strings() {
+    void init_fn_names() {
         [this]<std::size_t... Is>(std::index_sequence<Is...>) {
-            ((init_one_tag<Is>()), ...);
+            ((fn_names_[Is] = detail::format_tag<Entries::fn>()), ...);
         }(std::make_index_sequence<num_tasks>{});
-    }
-
-    template <std::size_t I>
-    void init_one_tag() {
-        using entry_t = typename detail::type_at<I, Entries...>::type;
-        using tag_t = typename entry_t::tag_type;
-        if constexpr (tag_t::value[0] != '\0') {
-            tag_strings_[I] = detail::prefixed_tag<tag_t>::value;
-        } else {
-            std::snprintf(auto_tag_bufs_[I], tag_buf_size,
-                          "reactor::task::TSK%zu", I);
-            tag_strings_[I] = auto_tag_bufs_[I];
-        }
     }
 
     std::size_t find_slot_for_handle(std::coroutine_handle<> h) const noexcept {
@@ -373,7 +383,7 @@ private:
             }
 
             log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
-                "INF", tag_strings_[I], "scratchpad triggered");
+                "INF", fn_names_[I], "scratchpad triggered");
         }
     }
 
@@ -396,13 +406,13 @@ private:
 
         if (pool_overflow_) {
             log::detail::log_impl<Config, log_level::error, Logger, ClockType>(
-                "ERR", tag_strings_[I], "reserved pool exhausted");
+                "ERR", fn_names_[I], "reserved pool exhausted");
             return error::capacity_exceeded;
         }
 
         if (meta.occupied) {
             log::detail::log_impl<Config, log_level::warn, Logger, ClockType>(
-                "WRN", tag_strings_[I], "already running");
+                "WRN", fn_names_[I], "already running");
             return error::task_already_running;
         }
 
@@ -431,7 +441,7 @@ private:
         else meta.occupied = true;
 
         log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
-            "INF", tag_strings_[I], "triggered");
+            "INF", fn_names_[I], "triggered");
         return error::ok;
     }
 
@@ -486,7 +496,7 @@ public:
             tasks_[i].self = self_ptrs[i];
             tasks_[i].scratch_offset = scratch_unused;
         }
-        init_tag_strings();
+        init_fn_names();
         probe_frame_sizes();
     }
 
@@ -503,7 +513,7 @@ public:
                     std::coroutine_handle<> h) noexcept {
         if (timer_count_ >= Config::max_timers) {
             std::size_t slot_idx = find_slot_for_handle(h);
-            const char* tag = (slot_idx < num_tasks) ? tag_strings_[slot_idx] : "unknown";
+            const char* tag = (slot_idx < num_tasks) ? fn_names_[slot_idx] : "unknown";
             log::detail::log_impl<Config, log_level::error, Logger, ClockType>(
                 "ERR", tag, "timer capacity exceeded (%zu/%zu)",
                 static_cast<std::size_t>(timer_count_),
@@ -513,7 +523,7 @@ public:
         timers_[timer_count_++] = {wake, h};
 
         std::size_t slot_idx = find_slot_for_handle(h);
-        const char* tag = (slot_idx < num_tasks) ? tag_strings_[slot_idx] : "unknown";
+        const char* tag = (slot_idx < num_tasks) ? fn_names_[slot_idx] : "unknown";
         auto delay_ms_val = std::chrono::duration_cast<
             std::chrono::milliseconds>(wake - ClockType::now()).count();
         log::detail::log_impl<Config, log_level::debug, Logger, ClockType>(
@@ -769,36 +779,32 @@ private:
     template <std::size_t I>
     void dump_one_line_log() const {
         using entry_t = typename detail::type_at<I, Entries...>::type;
-        constexpr auto entry_fn = entry_t::fn;
-        const char* fn_name = detail::fn_name<entry_fn>();
         const auto& meta = tasks_[I];
         if constexpr (entry_t::is_scratchpad) {
             char line[256];
-            std::snprintf(line, sizeof(line), "[%zu] %s  %s  scratchpad  size=%zuB",
-                          I, tag_strings_[I] + detail::log_tag_prefix_len, fn_name, meta.size);
-            log::detail::log_impl<Config, log_level::info, Logger, ClockType>("INF", tag_strings_[I], "%s", line);
+            std::snprintf(line, sizeof(line), "[%zu] <%s>  scratchpad  size=%zuB",
+                          I, fn_names_[I], meta.size);
+            log::detail::log_impl<Config, log_level::info, Logger, ClockType>("INF", fn_names_[I], "%s", line);
         } else {
             char line[256];
-            std::snprintf(line, sizeof(line), "[%zu] %s  %s  reserved  offset=%zu  size=%zuB",
-                          I, tag_strings_[I] + detail::log_tag_prefix_len, fn_name, meta.offset, meta.size);
-            log::detail::log_impl<Config, log_level::info, Logger, ClockType>("INF", tag_strings_[I], "%s", line);
+            std::snprintf(line, sizeof(line), "[%zu] <%s>  reserved  offset=%zu  size=%zuB",
+                          I, fn_names_[I], meta.offset, meta.size);
+            log::detail::log_impl<Config, log_level::info, Logger, ClockType>("INF", fn_names_[I], "%s", line);
         }
     }
 
     template <std::size_t I, typename Sink>
     void dump_one_line_sink(Sink& sink) const {
         using entry_t = typename detail::type_at<I, Entries...>::type;
-        constexpr auto entry_fn = entry_t::fn;
-        const char* fn_name = detail::fn_name<entry_fn>();
         const auto& meta = tasks_[I];
         char line[256];
         int n;
         if constexpr (entry_t::is_scratchpad) {
-            n = std::snprintf(line, sizeof(line), "[%zu] %s  %s  scratchpad  size=%zuB",
-                              I, tag_strings_[I] + detail::log_tag_prefix_len, fn_name, meta.size);
+            n = std::snprintf(line, sizeof(line), "[%zu] <%s>  scratchpad  size=%zuB",
+                              I, fn_names_[I], meta.size);
         } else {
-            n = std::snprintf(line, sizeof(line), "[%zu] %s  %s  reserved  offset=%zu  size=%zuB",
-                              I, tag_strings_[I] + detail::log_tag_prefix_len, fn_name, meta.offset, meta.size);
+            n = std::snprintf(line, sizeof(line), "[%zu] <%s>  reserved  offset=%zu  size=%zuB",
+                              I, fn_names_[I], meta.offset, meta.size);
         }
         if (n > 0) sink(std::string_view(line, static_cast<std::size_t>(n)));
     }
@@ -820,7 +826,7 @@ public:
                     meta.handle = {};
                 }
                 log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
-                    "INF", tag_strings_[i], "completed");
+                    "INF", fn_names_[i], "completed");
                 meta.occupied = false;
 
                 // A scratchpad task freed pool space — try to resume a waiter.
@@ -845,7 +851,7 @@ public:
                             meta.handle = {};
                         }
                         log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
-                            "INF", tag_strings_[i], "completed");
+                            "INF", fn_names_[i], "completed");
                         meta.occupied = false;
                         if (meta.is_scratchpad) try_resume_waiter();
                     }
@@ -871,7 +877,7 @@ public:
             std::size_t task_idx = find_slot_for_handle(h);
             if (task_idx < num_tasks) {
                 log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
-                    "INF", tag_strings_[task_idx], "timer expired, resuming");
+                    "INF", fn_names_[task_idx], "timer expired, resuming");
                 tasks_[task_idx].suspended = false;
             }
             h.resume();
@@ -884,7 +890,7 @@ public:
                         meta.handle = {};
                     }
                     log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
-                        "INF", tag_strings_[task_idx], "completed");
+                        "INF", fn_names_[task_idx], "completed");
                     tasks_[task_idx].occupied = false;
                     if (meta.is_scratchpad) try_resume_waiter();
                 }

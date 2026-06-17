@@ -11,7 +11,6 @@
 namespace {
 
 namespace cr = cgx::reactor;
-using cr::operator""_tag;
 
 using namespace std::chrono_literals;
 

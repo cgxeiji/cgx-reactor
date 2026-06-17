@@ -8,7 +8,6 @@
 namespace {
 
 namespace cr = cgx::reactor;
-using cgx::reactor::operator""_tag;
 
 using namespace std::chrono_literals;
 
@@ -77,8 +76,8 @@ TEST(ChannelTest, PushThenPop) {
     std::optional<int> pop_val;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"PSH1"_tag, &push_one<4>>(),
-        cr::register_task<"POP1"_tag, &pop_one<4>>());
+        cr::register_task<&push_one<4>>(),
+        cr::register_task<&pop_one<4>>());
 
     // Push a value — buffer has space, immediate.
     auto ec = eng.template trigger<&push_one<4>>(ch, 42, push_ec);
@@ -102,8 +101,8 @@ TEST(ChannelTest, BufferFillAndDrain) {
     std::optional<int> pop_vals[3] = {};
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"PSH2"_tag, &push_many<3>>(),
-        cr::register_task<"POP2"_tag, &pop_many<3>>());
+        cr::register_task<&push_many<3>>(),
+        cr::register_task<&pop_many<3>>());
 
     // Fill buffer with 3 values.
     auto ec = eng.template trigger<&push_many<3>>(ch, 10, 3, push_ec);
@@ -130,8 +129,8 @@ TEST(ChannelTest, BlockingPushResolvedByPop) {
     std::optional<int> pop_val;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"PSH3"_tag, &push_one<1>>(),
-        cr::register_task<"POP3"_tag, &pop_one<1>>());
+        cr::register_task<&push_one<1>>(),
+        cr::register_task<&pop_one<1>>());
 
     // Fill the single slot.
     auto ec = eng.template trigger<&push_one<1>>(ch, 10, push_ec);
@@ -162,8 +161,8 @@ TEST(ChannelTest, BlockingPopResolvedByPush) {
     cr::error push_ec = cr::error::ok;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"POP4"_tag, &pop_one<1>>(),
-        cr::register_task<"PSH4"_tag, &push_one<1>>());
+        cr::register_task<&pop_one<1>>(),
+        cr::register_task<&push_one<1>>());
 
     // Pop on empty buffer — consumer suspends.
     auto ec = eng.template trigger<&pop_one<1>>(ch, pop_val);
@@ -212,7 +211,7 @@ TEST(ChannelTest, CloseWakesConsumer) {
     std::optional<int> pop_val;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"POP7"_tag, &pop_one<1>>());
+        cr::register_task<&pop_one<1>>());
 
     // Pop on empty buffer — suspends.
     auto ec = eng.template trigger<&pop_one<1>>(ch, pop_val);
@@ -233,7 +232,7 @@ TEST(ChannelTest, CloseWakesProducer) {
     cr::error push_ec = cr::error::ok;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"PSH8"_tag, &push_one<1>>());
+        cr::register_task<&push_one<1>>());
 
     // Fill the single slot.
     ASSERT_EQ(ch.try_push(1), cr::error::ok);
@@ -257,8 +256,8 @@ TEST(ChannelTest, PingPong) {
     int cons_val = 0;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"PROD"_tag, &ping_pong_producer<2>>(),
-        cr::register_task<"CONS"_tag, &ping_pong_consumer<2>>());
+        cr::register_task<&ping_pong_producer<2>>(),
+        cr::register_task<&ping_pong_consumer<2>>());
 
     // Trigger consumer FIRST so it is already waiting when the producer
     // pushes 1 (direct handoff).  Then consumer pops 1 and pushes 2 back.
@@ -284,7 +283,7 @@ TEST(ChannelTest, PopOnClosedChannel) {
     std::optional<int> result;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"PCLS"_tag, &pop_on_closed_channel<4>>());
+        cr::register_task<&pop_on_closed_channel<4>>());
 
     auto ec = eng.template trigger<&pop_on_closed_channel<4>>(ch, result);
     ASSERT_EQ(ec, cr::error::ok);
@@ -321,7 +320,7 @@ TEST(ChannelTest, PushOnClosedChannel) {
     cr::error push_ec = cr::error::ok;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"POCL"_tag, &push_on_closed_simple<4>>());
+        cr::register_task<&push_on_closed_simple<4>>());
 
     auto ec = eng.template trigger<&push_on_closed_simple<4>>(ch, push_ec);
     ASSERT_EQ(ec, cr::error::ok);
@@ -374,10 +373,10 @@ TEST(ChannelTest, MultipleProducersFIFO) {
     std::optional<int> v1, v2, v3, v4, v5, v6, v7;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"PA"_tag, &push_a>(),
-        cr::register_task<"PB"_tag, &push_b>(),
-        cr::register_task<"PC"_tag, &push_c>(),
-        cr::register_task<"PQ"_tag, &pop_one<4>>());
+        cr::register_task<&push_a>(),
+        cr::register_task<&push_b>(),
+        cr::register_task<&push_c>(),
+        cr::register_task<&pop_one<4>>());
 
     // Fill the buffer so pushes block.
     ASSERT_EQ(ch.try_push(0), cr::error::ok);
@@ -436,12 +435,12 @@ TEST(ChannelTest, MultipleConsumersFIFO) {
     cr::error ec1 = cr::error::ok, ec2 = cr::error::ok, ec3 = cr::error::ok;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"CA"_tag, &cons_a>(),
-        cr::register_task<"CB"_tag, &cons_b>(),
-        cr::register_task<"CC"_tag, &cons_c>(),
-        cr::register_task<"P4A"_tag, &push_a>(),
-        cr::register_task<"P4B"_tag, &push_b>(),
-        cr::register_task<"P4C"_tag, &push_c>());
+        cr::register_task<&cons_a>(),
+        cr::register_task<&cons_b>(),
+        cr::register_task<&cons_c>(),
+        cr::register_task<&push_a>(),
+        cr::register_task<&push_b>(),
+        cr::register_task<&push_c>());
 
     // Three consumers queue up (buffer empty).
     ASSERT_EQ(eng.template trigger<&cons_a>(ch, v1), cr::error::ok);
@@ -479,8 +478,8 @@ TEST(ChannelTest, ConstChannelCanPop) {
     cr::error ec;
 
     auto eng = cr::make_engine<cr::default_config, cr::test::mock_clock>(
-        cr::register_task<"CPUS"_tag, &push_one<4>>(),
-        cr::register_task<"CPOP"_tag, &pop_one_const<4>>());
+        cr::register_task<&push_one<4>>(),
+        cr::register_task<&pop_one_const<4>>());
 
     // Push a value into the channel first.
     ASSERT_EQ(eng.template trigger<&push_one<4>>(ch, 42, ec), cr::error::ok);

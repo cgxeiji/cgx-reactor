@@ -180,7 +180,7 @@ protected:
 TEST_F(LoggerEngineTest, TriggerLogsTagAndTriggered) {
     int val = 0;
     auto eng = make_engine<default_config, test::mock_clock, capture_logger>(
-        register_task<"FLSH"_tag, &delayed_increment>());
+        register_task<&delayed_increment>());
 
     eng.template trigger<&delayed_increment>(val);
 
@@ -190,19 +190,19 @@ TEST_F(LoggerEngineTest, TriggerLogsTagAndTriggered) {
     for (const auto& msg : capture_logger::messages) {
         if (msg.find("triggered") != std::string::npos)
             found_triggered = true;
-        // Check tag format: <reactor::task::FLSH>
-        if (msg.find("<reactor::task::FLSH>") != std::string::npos)
+        // Check tag format: <~ayed_increment> (truncated to 16 bytes)
+        if (msg.find("<~ayed_increment>") != std::string::npos)
             found_tag = true;
     }
     EXPECT_TRUE(found_triggered) << "Should contain 'triggered'";
     EXPECT_TRUE(found_tag)
-        << "Should contain '<reactor::task::FLSH>' tag";
+        << "Should contain '<~ayed_increment>' tag (truncated)";
 }
 
 TEST_F(LoggerEngineTest, AlreadyRunningLogsWarning) {
     int val = 0;
     auto eng = make_engine<default_config, test::mock_clock, capture_logger>(
-        register_task<"RUN"_tag, &delayed_increment>());
+        register_task<&delayed_increment>());
 
     // First trigger starts the task (suspends on delay_ms).
     eng.template trigger<&delayed_increment>(val);
@@ -218,7 +218,8 @@ TEST_F(LoggerEngineTest, AlreadyRunningLogsWarning) {
         if (msg.find("already running") != std::string::npos) {
             found_warning = true;
             EXPECT_NE(msg.find("[WRN]"), std::string::npos);
-            EXPECT_NE(msg.find("<reactor::task::RUN>"),
+            // Truncated: delayed_increment → ~ayed_increment
+            EXPECT_NE(msg.find("<~ayed_increment>"),
                       std::string::npos);
         }
     }
@@ -229,7 +230,7 @@ TEST_F(LoggerEngineTest, TimerFlowLogsDelayExpiredCompleted) {
     int val = 0;
     // Use debug_config so DEBUG-level "delay … registered" shows up
     auto eng = make_engine<debug_config, test::mock_clock, capture_logger>(
-        register_task<"TIMR"_tag, &delayed_increment>());
+        register_task<&delayed_increment>());
 
     eng.template trigger<&delayed_increment>(val);
 
@@ -273,7 +274,7 @@ task immediate_complete_task(int& v) {
 TEST_F(LoggerEngineTest, CompletedLogInDirectResume) {
     int val = 0;
     auto eng = make_engine<default_config, test::mock_clock, capture_logger>(
-        register_task<"SYNC"_tag, &immediate_complete_task>());
+        register_task<&immediate_complete_task>());
 
     capture_logger::clear();
     eng.template trigger<&immediate_complete_task>(val);
@@ -295,7 +296,7 @@ TEST_F(LoggerEngineTest, CompletedLogInDirectResume) {
 TEST_F(LoggerEngineTest, CapacityExceededLogsError) {
     int val = 0;
     auto eng = make_engine<default_config, test::mock_clock, capture_logger>(
-        register_task<"CAP"_tag, &delayed_increment>());
+        register_task<&delayed_increment>());
 
     // Fill the timer queue directly.
     auto far = test::mock_clock::now() + 1h;

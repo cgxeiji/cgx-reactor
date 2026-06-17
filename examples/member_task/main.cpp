@@ -7,9 +7,8 @@
 // NOTE: We do NOT use `using namespace cgx::reactor` here because POSIX
 // `<sys/signal.h>` (pulled in via standard headers) declares `signal()`
 // in the global namespace, which clashes with `cgx::reactor::signal`.
-// Instead we alias the namespace and bring in the tag literal separately.
+// Instead we alias the namespace.
 namespace cr = cgx::reactor;
-using cr::operator""_tag;
 
 using namespace std::chrono_literals;
 
@@ -129,9 +128,9 @@ int main() {
     // they outlive it.  The engine and its coroutines hold references
     // (via coroutine frames) to member signals inside these objects.
     auto eng = cr::make_engine<cr::default_config, cr::steady_clock>(
-        cr::register_instance<"TEMP"_tag>(temp_sensor),
-        cr::register_instance<"PRES"_tag>(pressure_sensor),
-        cr::register_instance<"TERM"_tag>(printer));
+        cr::register_instance(temp_sensor),
+        cr::register_instance(pressure_sensor),
+        cr::register_instance(printer));
 
     // Trigger all three tasks.
     auto ec = eng.template trigger<&mock_temperature_sensor::poll_loop>();

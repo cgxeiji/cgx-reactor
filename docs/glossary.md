@@ -80,6 +80,19 @@ _Avoid_: Task pool, shared pool
 A task that is blocked waiting for space in the scratchpad pool. When the pool is full, new triggers join a FIFO waiter list. When space opens, the longest-waiting task gets it first.
 _Avoid_: Queued task, pending task
 
+**Task Handle**:
+Returned by `trigger()` and `try_trigger()`. Provides `error()` to check the result and `done()` to await task completion. The handle is valid for the lifetime of the engine.
+```cpp
+auto h = co_await engine.trigger<&task>();
+if (h.error() != cgx::reactor::error::ok) co_return;
+co_await h.done();  // suspends until task completes
+```
+_Avoid_: Future, promise, result
+
+**Completion Waiter**:
+A coroutine that is suspended waiting for a task to complete via `task_handle::done()`. Only 1 completion waiter per task is supported. The engine resumes the waiter when the task completes in `tick()`.
+_Avoid_: Join waiter, done waiter
+
 **FIFO Ordering**:
 The scratchpad pool uses FIFO ordering for waiters. If task C is waiting and task D is triggered (even though D would fit), D waits behind C. This prevents smaller tasks from starving larger ones.
 _Avoid_: Queue ordering, waiter ordering
@@ -108,7 +121,7 @@ Transitions a task from Idle → Running. Two dispatch mechanisms:
 - **Instance-based** (preferred): `eng.trigger(obj, &Class::method, args...)` — searches slots by self pointer AND function pointer. Supports multiple instances of the same class.
 - **Function pointer** (legacy): `eng.trigger<&fn>(args...)` — compile-time slot lookup. For member functions, triggers the FIRST registered instance.
 
-Returns `error::task_already_running` if the task is already active, or `error::task_not_registered` if the instance+method is not found.
+Returns a `task_handle` with an `error()` method. Returns `error::task_already_running` if the task is already active, or `error::task_not_registered` if the instance+method is not found. Use `handle.done()` to await task completion.
 _Avoid_: Start, launch, invoke
 
 **Tick**:
@@ -176,6 +189,8 @@ _Avoid_: Exception, status code, result
 - A **free_spec** is produced by **register_task** from a free function pointer and a **tag**
 - A **bound** is produced by **register_instance** from a class instance and its **reactor_tasks** alias
 - A **Task** transitions through: **Idle** → (trigger) → **Running** → (suspend) → **Suspended** → (resume) → **Running** or **Idle**
+- **Trigger** returns a **Task Handle** with `error()` and `done()` methods
+- `handle.done()` returns a **Completion Waiter** that suspends until the task completes
 - A **Tick** resumes expired timer-suspended tasks; signal-suspended tasks resume directly via fire()
 - A **Task** can `listen()` to a **Signal** (suspends until signal fires)
 - A **Task** can `fire()` a **Signal** (broadcasts to all suspended listeners)
@@ -195,7 +210,7 @@ _Avoid_: Exception, status code, result
 ## Example dialogue
 
 > **Dev:** "When I trigger a task that's already running, what happens?"
-> **Domain expert:** "You get an `error::task_already_running`. No queuing, no undefined behavior."
+> **Domain expert:** "You get a `task_handle` with `error::task_already_running`. No queuing, no undefined behavior. Check `handle.error()` before calling `handle.done()`."
 
 > **Dev:** "How does the event loop work?"
 > **Domain expert:** "You call `tick()` in a loop. Tick processes expired timers and resumes those tasks. If tasks suspend on signals, they resume directly when `fire()` is called — not via tick. The event loop just keeps ticking."
@@ -232,6 +247,15 @@ _Avoid_: Exception, status code, result
 
 > **Dev:** "What's the difference between `delay_until` and `delay_quantized`?"
 > **Domain expert:** "`delay_until(time_point)` takes an absolute time — you control the epoch. `delay_quantized(interval)` snaps to the clock's epoch grid automatically. If you're doing `next += 100ms` in a loop, use `delay_until`. If you just want 'every 100ms tick', use `delay_quantized`. Both are drift-free; `delay_quantized` is simpler when you don't need epoch control."
+
+> **Dev:** "How do I wait for a task to complete?"
+> **Domain expert:** "Use `task_handle::done()`. When you trigger a task, you get back a `task_handle`. Call `co_await handle.done()` to suspend until the task completes. Only one coroutine can wait per task — a second call to `done()` returns immediately without suspending."
+
+> **Dev:** "Can I trigger multiple tasks and wait for all of them?"
+> **Domain expert:** "Yes — use a scheduler coroutine. Trigger each task with `co_await engine.trigger<&task>()` to get a `task_handle`, then `co_await` each handle's `done()` method. The scheduler suspends until all tasks complete. See `examples/scratchpad/` for the full pattern."
+
+> **Dev:** "What if I trigger a task but it fails to allocate?"
+> **Domain expert:** "The `task_handle` will have an error code (e.g., `error::capacity_exceeded`). Call `handle.error()` to check. If you call `handle.done()` on a failed trigger, it returns immediately — the task was never started."
 
 ## Flagged ambiguities
 

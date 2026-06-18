@@ -322,6 +322,7 @@ All memory is statically allocated:
 | **Marking** | Default in `task_list` | `cr::scratch<&T::method>` in `task_list` |
 | **Trigger** | `trigger()` or `try_trigger()` | `trigger()` blocks if pool full, `try_trigger()` returns error |
 | **FIFO ordering** | N/A | Yes — tasks wait in line even if space available |
+| **Return type** | `task_handle` | `task_handle` |
 
 ### Scratchpad FIFO Ordering
 
@@ -338,6 +339,41 @@ D( 56B) → would fit (80B > 56B), but waits behind C (waiter #2)
 A completes → 1080B free → C still doesn't fit, D still waits
 B completes → 2080B free → C fits! C allocated. D fits! D allocated.
 ```
+
+### Task Handle and Completion Waiting
+
+`trigger()` and `try_trigger()` return a `task_handle` instead of a bare `error` code. The handle provides:
+
+- `error()` — returns the error code from the trigger operation
+- `done()` — returns an awaiter that suspends until the task completes
+
+**Example: scheduler pattern**
+```cpp
+cgx::reactor::task schedule() {
+    auto ha = co_await engine.trigger<&A>();
+    if (ha.error() != cgx::reactor::error::ok) co_return;
+
+    auto hb = co_await engine.trigger<&B>();
+    auto hc = co_await engine.trigger<&C>();
+    auto hd = co_await engine.trigger<&D>();
+
+    co_await ha.done();  // suspends until A completes
+    co_await hb.done();  // suspends until B completes
+    co_await hc.done();  // suspends until C completes
+    co_await hd.done();  // suspends until D completes
+}
+```
+
+**Completion waiter semantics:**
+- Only 1 waiter per task (single `coroutine_handle` in `task_meta`)
+- If `done()` is called on an already-completed task, returns immediately
+- If `done()` is called twice for the same task, the second call does not suspend
+- The engine resumes the completion waiter when the task completes in `tick()`
+
+**Edge cases:**
+- `done()` on a failed trigger (e.g., `capacity_exceeded`) returns immediately
+- `done()` on a task that completed synchronously returns immediately
+- Engine destruction with pending completion waiters is undefined behavior
 
 ## Thread-Local Context
 
@@ -357,6 +393,15 @@ All operations return `error` codes:
 - `error::capacity_exceeded` — timer queue, listener queue, or channel full
 - `error::listener_limit_exceeded` — too many concurrent listeners
 - `error::closed` — channel was closed by the producer
+
+`trigger()` and `try_trigger()` return a `task_handle` with an `error()` method. The error code is accessible via `handle.error()`:
+```cpp
+auto h = co_await engine.trigger<&task>();
+if (h.error() != cgx::reactor::error::ok) {
+    // handle error
+}
+co_await h.done();  // wait for completion
+```
 
 No exceptions are thrown.
 
@@ -442,6 +487,6 @@ Seven runnable examples live under `examples/`:
 | `examples/error_handling/` | Exercises every error code (`task_already_running`, `capacity_exceeded`, `listener_limit_exceeded`, `pool_overflow`) with a deliberately small `Config` so the limits are easy to hit. |
 | `examples/member_task/` | Member-function API with `reactor_tasks` aliases and `register_instance`. Three classes — two mock sensors and a serial printer consumer. |
 | `examples/instance_trigger/` | Instance-based trigger dispatch. Two instances of the same sensor class, triggered independently by instance reference. Shows `dump()` with accurate frame sizes. |
-| `examples/scratchpad/` | Scratchpad pool with FIFO ordering. Four tasks with different frame sizes. Shows how D would fit but waits behind C (FIFO). Demonstrates `co_await trigger()` blocking behavior. |
+| `examples/scratchpad/` | Scratchpad pool with FIFO ordering and task handle completion waiting. Four tasks with different frame sizes. Shows how D would fit but waits behind C (FIFO). Demonstrates `co_await trigger()` blocking behavior, `task_handle::done()` for completion waiting, and SIGINT-based clean shutdown. |
 | `examples/channel/` | Point-to-point communication with `channel<T, Capacity>`. ISR-to-task data flow with blocking `pop()` and non-blocking `try_push()`. |
 | `examples/timer/` | Side-by-side comparison of all three timer primitives — `delay_ms` (drifty), `delay_until` (precise), `delay_quantized` (grid-aligned). |

@@ -59,6 +59,15 @@ All barebones items are complete (this milestone was reached before the refactor
 - **~~Timer example~~** — `examples/timer/` runs three concurrent tasks comparing `delay_ms` (drifty), `delay_until` (precise), and `delay_quantized` (grid-aligned) with wall-clock timestamps.
 - **~~Test coverage~~** — 7 new tests: `DelayUntilTest` (WakeAtExactTime, PastTimePoint, QueueFull), `DelayQuantizedTest` (GridAlignment, DriftFreePeriodic, ExactTickBoundary, QueueFull).
 
+## 2026-06-17 — Task Handle ✓
+
+- **~~Task handle~~** — `trigger()` and `try_trigger()` return `task_handle` instead of bare `error` codes. The handle provides `error()` to check the result and `done()` to await task completion.
+- **~~Completion waiting~~** — `task_handle::done()` returns an awaiter that suspends until the task completes. Only 1 completion waiter per task. The engine resumes the waiter when the task completes in `tick()`.
+- **~~Re-entrancy fix~~** — Fixed re-entrancy bug in `try_resume_waiter()`: waiter is now removed from the list before resuming the coroutine, preventing duplicate entries if the resumed coroutine triggers new tasks.
+- **~~Scheduler pattern~~** — Enables orchestrator coroutines that trigger multiple tasks and wait for their completion. Example: `schedule()` coroutine triggers A, B, C, D and waits for all to complete.
+- **~~Signal-based termination~~** — Scratchpad example updated to use SIGINT signal handler instead of hardcoded timeout. Demonstrates clean shutdown pattern.
+- **~~Test coverage~~** — All 86 tests updated to use `task_handle` API. Scratchpad, instance trigger, and all other test suites pass.
+
 ## Upcoming
 
 - **Task lifecycle (`cancel()`, `join()`)** — explicit management of running tasks

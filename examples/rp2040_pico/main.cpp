@@ -1,0 +1,225 @@
+// rp2040_pico example — cgx::reactor running on a Pi Pico (RP2040)
+//
+// Uses pico-sdk 2.2.0 (board=pico) with the cgx::reactor header-only library
+// at ../../include. Demonstrates:
+//   * Two one-shot scratchpad tasks (init_led, init_temp) with staged
+//     simulated-long-init delays for GPIO and ADC setup
+//   * Two reserved-loop tasks (blink, temp) recurring via delay_ms<pico_clock>
+//   * A reserved-loop task (dump) that periodically reports engine state
+//   * A free `bootstrap` coroutine resumed manually — drives the engine
+//     to allocate the reserved tasks and reclaim the scratchpad slot
+//   * A 1 ms repeating timer + __wfi event loop (low-power, no std::thread)
+//
+// The reactor is driven exclusively through full `cgx::reactor::` namespace
+// qualifiers — no `using namespace`, no alias.
+
+#include <cgx/reactor.hpp>
+
+#include <cstdio>
+#include <string_view>
+
+#include "hardware/adc.h"
+#include "hardware/sync.h"
+#include "hardware/timer.h"
+#include "pico/stdlib.h"
+#include "pico_clock.hpp"
+
+// -----------------------------------------------------------------------
+// Dump sink — file-scope (stateless) function so the C thunk that the
+// coordinator's dumper calls can reference it without captures.
+// -----------------------------------------------------------------------
+
+static void dump_sink(std::string_view s) {
+    std::printf("%.*s\n", static_cast<int>(s.size()), s.data());
+}
+
+// -----------------------------------------------------------------------
+// CPU temperature — pico-sdk 2.x has no adc_read_temp(); we implement the
+// documented formula ourselves:
+//   T = 27 - (V - 0.706) / 0.001721   (V from 12-bit ADC, 3.3 V reference)
+// -----------------------------------------------------------------------
+
+static float read_cpu_temp_c() {
+    adc_select_input(ADC_TEMPERATURE_CHANNEL_NUM);
+    const uint16_t raw = adc_read();
+    const float voltage = static_cast<float>(raw) * 3.3f / 4096.0f;
+    return 27.0f - (voltage - 0.706f) / 0.001721f;
+}
+
+// -----------------------------------------------------------------------
+// Coordinator — owns four reactor tasks
+// -----------------------------------------------------------------------
+
+class coordinator {
+public:
+    // Type-erased dumper: set from main() once the engine exists.
+    void set_dumper(void (*fn)(void*), void* ctx) {
+        dump_fn_ = fn;
+        dump_ctx_ = ctx;
+    }
+
+    // One-shot scratchpad init — runs exactly once, then reclaims the slot.
+    cgx::reactor::task init_led() {
+        gpio_init(PICO_DEFAULT_LED_PIN);
+        gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+        std::printf("[init_led] simulating long init times\n");
+        std::printf("[init_led] stage 1/4\n");
+        co_await cgx::reactor::delay_ms<pico_clock>(200);
+        std::printf("[init_led] stage 2/4\n");
+        co_await cgx::reactor::delay_ms<pico_clock>(300);
+        std::printf("[init_led] stage 3/4\n");
+        co_await cgx::reactor::delay_ms<pico_clock>(200);
+        std::printf("[init_led] stage 4/4\n");
+        co_await cgx::reactor::delay_ms<pico_clock>(100);
+        std::printf("[init_led] LED ready\n");
+        co_return;
+    }
+
+    cgx::reactor::task init_temp() {
+        adc_init();
+        adc_set_temp_sensor_enabled(true);
+        std::printf("[init_temp] simulating long init times\n");
+        std::printf("[init_temp] stage 1/3\n");
+        co_await cgx::reactor::delay_ms<pico_clock>(500);
+        std::printf("[init_temp] stage 2/3\n");
+        co_await cgx::reactor::delay_ms<pico_clock>(50);
+        std::printf("[init_temp] stage 3/3\n");
+        co_await cgx::reactor::delay_ms<pico_clock>(1000);
+        std::printf("[init_temp] ADC temp sensor ready\n");
+        co_return;
+    }
+
+    // Reserved loop — blink the onboard LED at ~2 Hz.
+    cgx::reactor::task blink() {
+        for (;;) {
+            gpio_put(PICO_DEFAULT_LED_PIN, !gpio_get(PICO_DEFAULT_LED_PIN));
+            co_await cgx::reactor::delay_ms<pico_clock>(500);
+        }
+    }
+
+    // Reserved loop — print the CPU temperature every second.
+    cgx::reactor::task temp() {
+        for (;;) {
+            const float t = read_cpu_temp_c();
+            std::printf("[temp] CPU: %.2f C\n", static_cast<double>(t));
+            co_await cgx::reactor::delay_ms<pico_clock>(1000);
+        }
+    }
+
+    // Reserved loop — dump the engine's task memory every 5 seconds.
+    cgx::reactor::task dump() {
+        for (;;) {
+            if (dump_fn_) dump_fn_(dump_ctx_);
+            co_await cgx::reactor::delay_ms<pico_clock>(5000);
+        }
+    }
+
+    using reactor_tasks = cgx::reactor::task_list<
+        cgx::reactor::scratch_v<&coordinator::init_led>,
+        cgx::reactor::scratch_v<&coordinator::init_temp>,
+        &coordinator::blink,
+        &coordinator::temp,
+        &coordinator::dump
+    >;
+
+private:
+    void (*dump_fn_)(void*) = nullptr;
+    void* dump_ctx_ = nullptr;
+};
+
+// -----------------------------------------------------------------------
+// 1 ms tick timer — wakes main loop from WFI, drives eng.tick()
+// -----------------------------------------------------------------------
+
+static volatile bool tick_pending = false;
+
+/// Repeating-timer callback (C linkage — no captures allowed).
+/// Only sets a flag; the actual tick() runs in the main-loop context.
+bool timer_callback([[maybe_unused]] repeating_timer_t* rt) {
+    tick_pending = true;
+    return true;  // keep repeating
+}
+
+// -----------------------------------------------------------------------
+// Bootstrap coroutine — runs `init` (scratchpad) then triggers the three
+// reserved loops. This is a free `cgx::reactor::task`, NOT registered in
+// the engine; main() resumes it manually via b.handle().resume().
+// -----------------------------------------------------------------------
+
+template <typename E>
+cgx::reactor::task bootstrap(E& eng, coordinator& coord) {
+    // init_led and init_temp are scratchpad tasks with staged delays
+    // (800 ms / 1550 ms), so they suspend on delay_ms and complete
+    // asynchronously via the event loop's tick(). `co_await h_*.done()`
+    // therefore genuinely suspends bootstrap until each init finishes —
+    // showcasing the task_handle::done() completion-wait API. main's
+    // b.handle().resume() runs bootstrap only until the first done();
+    // it resumes later inside tick() once the inits complete, then
+    // triggers the blink/temp/dump loops.
+    std::printf("[bootstrap] init starting...\n");
+    std::printf("[bootstrap] init_led() triggering\n");
+    auto h_led = co_await eng.template trigger<&coordinator::init_led>();
+    std::printf("[bootstrap] init_temp() triggering\n");
+    auto h_temp = co_await eng.template trigger<&coordinator::init_temp>();
+    co_await h_led.done();
+    co_await h_temp.done();
+    std::printf("[bootstrap] init completed\n");
+
+    eng.trigger(coord, &coordinator::blink);
+    eng.trigger(coord, &coordinator::temp);
+    eng.trigger(coord, &coordinator::dump);
+    std::printf("[bootstrap] blink/temp/dump triggered\n");
+    co_return;
+}
+
+// -----------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------
+
+int main() {
+    stdio_init_all();
+    sleep_ms(2000);  // wait for USB CDC enumeration
+
+    std::printf("\n=== rp2040_pico (cgx::reactor on RP2040) ===\n\n");
+
+    coordinator coord;
+
+    auto eng = cgx::reactor::make_engine<cgx::reactor::default_config, pico_clock>(
+        cgx::reactor::register_instance(coord));
+
+    // The engine type is not nameable here without decltype(eng) — wrap
+    // eng.dump(sink) in a stateless C thunk so the coordinator can call
+    // it from its own `dump` task. The sink is a file-scope function so
+    // the thunk needs no captures.
+    coord.set_dumper(+[](void* p) {
+        using engine_t = std::remove_reference_t<decltype(eng)>;
+        static_cast<engine_t*>(p)->dump(dump_sink);
+    }, &eng);
+
+    // (1) initial state dump
+    std::printf("=== engine: initial ===\n");
+    eng.dump(dump_sink);
+
+    // Run bootstrap synchronously — allocates the reserved tasks and
+    // reclaims the scratchpad slot.
+    auto b = bootstrap(eng, coord);
+    b.handle().resume();
+
+    // (2) mid-bootstrap snapshot: init_led/init_temp suspended on their
+    //     staged delays; blink/temp/dump not yet triggered.
+    std::printf("=== engine: bootstrap suspended (inits running, loops pending) ===\n");
+    eng.dump(dump_sink);
+
+    // 1 ms repeating timer — wakes the main loop from WFI each millisecond.
+    repeating_timer_t tick_timer;
+    add_repeating_timer_ms(-1, timer_callback, nullptr, &tick_timer);
+
+    // Event loop (low-power: WFI, wake on timer IRQ).
+    while (true) {
+        __wfi();
+        if (tick_pending) {
+            tick_pending = false;
+            eng.tick();
+        }
+    }
+}

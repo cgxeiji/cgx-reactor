@@ -6,8 +6,11 @@
 //     simulated-long-init delays for GPIO and ADC setup
 //   * Two reserved-loop tasks (blink, temp) recurring via delay_ms<pico_clock>
 //   * A reserved-loop task (dump) that periodically reports engine state
-//   * A free `bootstrap` coroutine resumed manually — drives the engine
-//     to allocate the reserved tasks and reclaim the scratchpad slot
+//   * A reserved member task `coordinator::bootstrap` that drives the
+//     inits to completion via the abstract `engine&` interface, then
+//     triggers the blink/temp/dump loops. Triggered once from main()
+//     using the concrete engine's instance-based trigger with arg
+//     forwarding (`eng.trigger(coord, &coordinator::bootstrap, eng)`).
 //   * A 1 ms repeating timer + __wfi event loop (low-power, no std::thread)
 //
 // The reactor is driven exclusively through full `cgx::reactor::` namespace
@@ -47,7 +50,7 @@ static float read_cpu_temp_c() {
 }
 
 // -----------------------------------------------------------------------
-// Coordinator — owns four reactor tasks
+// Coordinator — owns the reactor tasks, including the bootstrap driver
 // -----------------------------------------------------------------------
 
 class coordinator {
@@ -114,12 +117,42 @@ public:
         }
     }
 
+    // Reserved member task — runs the init sequence via the abstract
+    // `engine&` interface, then triggers the recurring loops.
+    // Takes `engine&` so the probe falls back to `default_frame_size`
+    // (1024B); the reserved pool (default 8192B) accommodates the
+    // 4 reserved tasks (bootstrap + blink + temp + dump).
+    cgx::reactor::task bootstrap(cgx::reactor::engine& eng) {
+        // Interface `trigger(uid)` is non-blocking (returns a
+        // `task_handle`); the `co_await h.done()` calls are what
+        // suspend bootstrap until each init completes.
+        std::printf("[bootstrap] init starting...\n");
+        std::printf("[bootstrap] init_led() triggering\n");
+        auto h_led = eng.trigger(
+            cgx::reactor::task_uid_v<&coordinator::init_led>);
+        if (h_led.error() != cgx::reactor::error::ok) co_return;
+        std::printf("[bootstrap] init_temp() triggering\n");
+        auto h_temp = eng.trigger(
+            cgx::reactor::task_uid_v<&coordinator::init_temp>);
+        if (h_temp.error() != cgx::reactor::error::ok) co_return;
+        co_await h_led.done();
+        co_await h_temp.done();
+        std::printf("[bootstrap] init completed\n");
+
+        eng.trigger(cgx::reactor::task_uid_v<&coordinator::blink>);
+        eng.trigger(cgx::reactor::task_uid_v<&coordinator::temp>);
+        eng.trigger(cgx::reactor::task_uid_v<&coordinator::dump>);
+        std::printf("[bootstrap] blink/temp/dump triggered\n");
+        co_return;
+    }
+
     using reactor_tasks = cgx::reactor::task_list<
         cgx::reactor::scratch_v<&coordinator::init_led>,
         cgx::reactor::scratch_v<&coordinator::init_temp>,
         &coordinator::blink,
         &coordinator::temp,
-        &coordinator::dump
+        &coordinator::dump,
+        &coordinator::bootstrap
     >;
 
 private:
@@ -138,38 +171,6 @@ static volatile bool tick_pending = false;
 bool timer_callback([[maybe_unused]] repeating_timer_t* rt) {
     tick_pending = true;
     return true;  // keep repeating
-}
-
-// -----------------------------------------------------------------------
-// Bootstrap coroutine — runs `init` (scratchpad) then triggers the three
-// reserved loops. This is a free `cgx::reactor::task`, NOT registered in
-// the engine; main() resumes it manually via b.handle().resume().
-// -----------------------------------------------------------------------
-
-template <typename E>
-cgx::reactor::task bootstrap(E& eng, coordinator& coord) {
-    // init_led and init_temp are scratchpad tasks with staged delays
-    // (800 ms / 1550 ms), so they suspend on delay_ms and complete
-    // asynchronously via the event loop's tick(). `co_await h_*.done()`
-    // therefore genuinely suspends bootstrap until each init finishes —
-    // showcasing the task_handle::done() completion-wait API. main's
-    // b.handle().resume() runs bootstrap only until the first done();
-    // it resumes later inside tick() once the inits complete, then
-    // triggers the blink/temp/dump loops.
-    std::printf("[bootstrap] init starting...\n");
-    std::printf("[bootstrap] init_led() triggering\n");
-    auto h_led = co_await eng.template trigger<&coordinator::init_led>();
-    std::printf("[bootstrap] init_temp() triggering\n");
-    auto h_temp = co_await eng.template trigger<&coordinator::init_temp>();
-    co_await h_led.done();
-    co_await h_temp.done();
-    std::printf("[bootstrap] init completed\n");
-
-    eng.trigger(coord, &coordinator::blink);
-    eng.trigger(coord, &coordinator::temp);
-    eng.trigger(coord, &coordinator::dump);
-    std::printf("[bootstrap] blink/temp/dump triggered\n");
-    co_return;
 }
 
 // -----------------------------------------------------------------------
@@ -200,14 +201,19 @@ int main() {
     std::printf("=== engine: initial ===\n");
     eng.dump(dump_sink);
 
-    // Run bootstrap synchronously — allocates the reserved tasks and
-    // reclaims the scratchpad slot.
-    auto b = bootstrap(eng, coord);
-    b.handle().resume();
+    // Trigger the bootstrap member task via the concrete engine's
+    // instance-based trigger. `eng` is `basic_engine&`; the bootstrap
+    // takes `engine&` (abstract), so the arg forwards via the
+    // concrete overload's argument forwarding. The trigger runs
+    // bootstrap until the first `co_await h_led.done()` suspends
+    // (init_led and init_temp are scratchpad tasks, each suspended on
+    // their first delay_ms at this point).
+    eng.trigger(coord, &coordinator::bootstrap, eng);
 
-    // (2) mid-bootstrap snapshot: init_led/init_temp suspended on their
-    //     staged delays; blink/temp/dump not yet triggered.
-    std::printf("=== engine: bootstrap suspended (inits running, loops pending) ===\n");
+    // (2) post-trigger dump: bootstrap is suspended on h_led.done(),
+    //     init_led and init_temp are both running (suspended on their
+    //     first delay_ms), blink/temp/dump loops not yet triggered.
+    std::printf("=== engine: bootstrap running (inits pending) ===\n");
     eng.dump(dump_sink);
 
     // 1 ms repeating timer — wakes the main loop from WFI each millisecond.

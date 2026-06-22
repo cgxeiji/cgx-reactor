@@ -7,7 +7,7 @@ Domain language for the cgx-reactor coroutine-based reactive scheduler library, 
 ### Core Concepts
 
 **Engine**:
-The reactor instance that manages task scheduling and timer queue. Template-parameterized for compile-time task registration and configuration. Constructed via `make_engine<Config, Clock>(specs...)`.
+The reactor instance that manages task scheduling and timer queue. The library exposes two types: the abstract interface `cgx::reactor::engine` (non-templated, passable by `engine&` to functions that should not depend on template parameters) and the concrete templated `cgx::reactor::basic_engine<Config, Clock, Logger, Entries...>` (returned by `make_engine<Config, Clock, Logger>(specs...)`). The concrete type publicly inherits the abstract interface. The domain concept "Engine" covers both.
 _Avoid_: Reactor, scheduler, dispatcher
 
 **Task**:
@@ -80,6 +80,10 @@ _Avoid_: Task pool, shared pool
 A task that is blocked waiting for space in the scratchpad pool. When the pool is full, new triggers join a FIFO waiter list. When space opens, the longest-waiting task gets it first.
 _Avoid_: Queued task, pending task
 
+**Task UID**:
+A strongly-typed 32-bit identifier (`cgx::reactor::task_uid`) for a registered task, derived as the FNV-1a hash of the function's `__PRETTY_FUNCTION__`-extracted name. `task_uid_v<&fn>` is a compile-time constant computable without any engine type — the same UID at the engine registration site and at every call site for the same function. Used by the interface `trigger(task_uid)` / `trigger(obj, task_uid)` for runtime dispatch via a fixed-size open-addressing hashmap. Distinct for distinct functions (compile-time-enforced by `basic_engine`'s `static_assert`); equal UIDs are allowed only for the same function (multi-instance registration).
+_Avoid_: Task id, function pointer (UIDs are derived from fn pointers but are an independent identifier)
+
 **Task Handle**:
 Returned by `trigger()` and `try_trigger()`. Provides `error()` to check the result and `done()` to await task completion. The handle is valid for the lifetime of the engine.
 ```cpp
@@ -121,7 +125,11 @@ Transitions a task from Idle → Running. Two dispatch mechanisms:
 - **Instance-based** (preferred): `eng.trigger(obj, &Class::method, args...)` — searches slots by self pointer AND function pointer. Supports multiple instances of the same class.
 - **Function pointer** (legacy): `eng.trigger<&fn>(args...)` — compile-time slot lookup. For member functions, triggers the FIRST registered instance.
 
-Returns a `task_handle` with an `error()` method. Returns `error::task_already_running` if the task is already active, or `error::task_not_registered` if the instance+method is not found. Use `handle.done()` to await task completion.
+Both return a `task_handle` with an `error()` method. Returns `error::task_already_running` if the task is already active, or `error::task_not_registered` if the instance+method is not found. Use `handle.done()` to await task completion.
+
+A third, **UID-based** form is available on the abstract `engine` interface and is useful when a function should be passable to a non-templated API:
+- **UID-based, arg-free, non-blocking** (interface): `eng.trigger(task_uid_v<&fn>)` — runtime dispatch via a fixed-size hashmap. `eng.trigger(obj, task_uid_v<&fn>)` — same with instance disambiguation. `trigger(uid)` hits the first registered instance; `trigger(obj, uid)` walks the probe chain matching `self`. Both return a `task_handle`; `co_await h.done()` works as for the templated forms. Cannot forward typed args (type erasure).
+- **Compile-time, blocking-capable for scratchpad** (concrete class): `eng.trigger<&fn>(args...)` and `eng.trigger(obj, &Class::method, args...)` — full arg forwarding; for scratchpad tasks, the templated form returns a blocking awaiter that suspends the caller if the pool is full.
 _Avoid_: Start, launch, invoke
 
 **Tick**:

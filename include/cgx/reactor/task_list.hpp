@@ -2,6 +2,7 @@
 
 #include <coroutine>
 #include <cstddef>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -85,6 +86,7 @@ struct task_meta {
     std::size_t offset = 0;          // reserved pool offset
     std::size_t size = 0;             // coroutine frame size
     std::size_t scratch_offset = 0;   // offset in scratchpad pool (0 = not allocated)
+    std::uint32_t uid = 0;            // FNV-1a of function name (filled at engine ctor)
     // Completion waiter (single coroutine waiting via task_handle::done())
     std::coroutine_handle<> completion_waiter;
     bool has_completion_waiter = false;
@@ -103,6 +105,23 @@ struct engine_report {
     std::size_t reserved_count;
     std::size_t scratchpad_count;
     std::size_t scratchpad_size;
+};
+
+// ---------------------------------------------------------------------------
+// engine_static_report — compile-time engine metadata
+//
+// All fields are constexpr-derivable from `Config` + `sizeof...(Entries)`.
+// NO frame sizes (coroutines can't be created in constexpr context in
+// C++20).  Usable in `static_assert` and deployment-time prints.
+// ---------------------------------------------------------------------------
+
+struct engine_static_report {
+    std::size_t task_count;
+    std::size_t reserved_count;
+    std::size_t scratchpad_count;
+    std::size_t reserved_pool_size;
+    std::size_t scratchpad_pool_size;
+    std::size_t max_timers;
 };
 
 template <typename Class>
@@ -139,16 +158,20 @@ struct concat<type_list<As...>, type_list<Bs...>> {
 };
 
 // Type at index
+//
+// Implemented via `std::tuple_element_t` rather than recursive
+// inheritance.  The recursive form instantiates O(N) nested types
+// per use, which is fine for small N but causes the N=1024 benchmark
+// (and any future large-N engine) to take minutes to compile.
+// `std::tuple_element_t` delegates to the standard library's
+// implementation, which uses a divide-and-conquer approach
+// (instantiates O(log N) types).  For N=1024, compile time drops
+// from minutes to seconds; for N=86 (the existing largest test
+// engine) it's unchanged.
 template <std::size_t I, typename... Ts>
-struct type_at;
-
-template <typename T, typename... Rest>
-struct type_at<0, T, Rest...> {
-    using type = T;
+struct type_at {
+    using type = std::tuple_element_t<I, std::tuple<Ts...>>;
 };
-
-template <std::size_t I, typename T, typename... Rest>
-struct type_at<I, T, Rest...> : type_at<I - 1, Rest...> {};
 
 // Traits to detect and unwrap scratch<> wrappers
 template <typename T>

@@ -1,0 +1,10 @@
+build/
+.pico-sdk/
+*.uf2
+*.elf
+*.bin
+*.hex
+*.dis
+*.map
+compile_commands.json
+.DS_Store

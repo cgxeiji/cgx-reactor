@@ -7,6 +7,7 @@
 #include <cgx/reactor/timer.hpp>
 #include <cgx/reactor/task_list.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -21,19 +22,29 @@
 
 namespace cgx::reactor {
 
-// Forward declaration (needed by engine_from_desc_list)
+// ---------------------------------------------------------------------------
+// Forward declarations
+// ---------------------------------------------------------------------------
+
+class engine;                       // abstract base interface
+struct task_handle;                 // non-templated completion handle
+struct task_completion_awaiter;     // non-templated completion awaiter
+
 template <typename Config, typename Clock, typename Logger = no_logger, typename... Entries>
-class engine;
+class basic_engine;                 // concrete templated engine (renamed from `engine`)
+
+// ---------------------------------------------------------------------------
+// detail::engine_from_desc_list — build concrete engine type from descriptors
+// ---------------------------------------------------------------------------
 
 namespace detail {
 
-// Build engine type from a type_list of descriptors
 template <typename Config, typename Clock, typename Logger, typename List>
 struct engine_from_desc_list;
 
 template <typename Config, typename Clock, typename Logger, typename... Ds>
 struct engine_from_desc_list<Config, Clock, Logger, detail::type_list<Ds...>> {
-    using type = engine<Config, Clock, Logger, Ds...>;
+    using type = basic_engine<Config, Clock, Logger, Ds...>;
 };
 
 // -------------------------------------------------------------------------
@@ -44,7 +55,7 @@ template <std::size_t N>
 struct compiled_str {
     char data[N]{};  // N includes null terminator
     static constexpr std::size_t size = N;  // includes null
-    
+
     constexpr operator const char*() const { return data; }
     constexpr std::string_view view() const { return {data, N - 1}; }
 };
@@ -64,7 +75,7 @@ constexpr auto extract_fn_name() {
     constexpr auto end = pretty.find(']', start);
     static_assert(end != std::string_view::npos, "Cannot find ] after Fn = ");
     constexpr auto name = pretty.substr(start, end - start);
-    
+
     // Strip "&" or "&(" / ")"
     if constexpr (name.starts_with("&(") && name.ends_with(")")) {
         constexpr auto stripped = name.substr(2, name.size() - 3);
@@ -98,7 +109,7 @@ template <auto Fn>
 const char* format_tag() {
     static constexpr auto name = extract_fn_name<Fn>();
     static char tag[16]; // 15 bytes content + 1 byte null
-    
+
     if constexpr (name.size <= 16) {
         // Fits: store as-is (name.size includes null)
         for (std::size_t i = 0; i < name.size; ++i)
@@ -119,11 +130,222 @@ const char* format_tag() {
 /// with parameters).  The probe only works for no-arg coroutines.
 static constexpr std::size_t default_frame_size = 1024;
 
+// -------------------------------------------------------------------------
+// fnv1a — FNV-1a 32-bit hash of a string view
+//
+// Used to derive a stable per-function UID from `extract_fn_name<Fn>()`.
+// Constant-expression evaluable.
+// -------------------------------------------------------------------------
+
+constexpr std::uint32_t fnv1a(std::string_view s) noexcept {
+    std::uint32_t h = 0x811c9dc5u;
+    for (char c : s) {
+        h ^= static_cast<std::uint8_t>(c);
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
+// -------------------------------------------------------------------------
+// uid_pair_ok — pairwise check for the compile-time distinctness assert
+//
+// Two UIDs are "ok" if they are different (no collision), OR if they
+// belong to the same function (multi-instance registration, which is
+// legal and expected).  Factored as a free constexpr function so the
+// collision-detection LOGIC can be unit-tested independently of any
+// real hash collisions.
+// -------------------------------------------------------------------------
+
+constexpr bool uid_pair_ok(std::uint32_t a, std::uint32_t b, bool same_fn) noexcept {
+    return a != b || same_fn;
+}
+
+// -------------------------------------------------------------------------
+// next_pow2 — smallest power of 2 ≥ n, with floor 1
+//
+// Used to size the UID hashmap (open-addressing, linear probing) so the
+// index can be computed with `idx & (size - 1)`.
+// -------------------------------------------------------------------------
+
+constexpr std::size_t next_pow2(std::size_t n) noexcept {
+    if (n <= 1) return 1;
+    std::size_t p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
 }  // namespace detail
+
+// ---------------------------------------------------------------------------
+// task_uid — strongly-typed 32-bit UID for a registered task
+//
+// The UID is the FNV-1a hash of the function's pretty name.  Strongly
+// typed to prevent mixing with raw uint32 values.
+// ---------------------------------------------------------------------------
+
+struct task_uid {
+    std::uint32_t value;
+    friend constexpr bool operator==(task_uid, task_uid) = default;
+};
+
+/// Compile-time task UID: `task_uid_v<&fn>` is the UID of the function
+/// `fn` (free or member function NTTP).  Computable without any engine
+/// type — identical UIDs at engine registration and call sites for the
+/// same fn; distinct UIDs for distinct fns (with high probability under
+/// FNV-1a; the engine enforces distinctness for distinct fns at compile
+/// time, see `basic_engine`'s static_assert).
+template <auto Fn>
+constexpr task_uid task_uid_v = task_uid{ detail::fnv1a(detail::extract_fn_name<Fn>().view()) };
+
+// ---------------------------------------------------------------------------
+// task_completion_awaiter — non-templated completion awaiter
+//
+// Suspends the calling coroutine until the targeted task completes.
+// Uses the abstract `engine` virtuals (`task_is_done`,
+// `register_completion_waiter`) for dispatch.
+//
+// Method bodies are defined out-of-line below, after `engine` is complete,
+// because inline member function bodies cannot perform member access
+// through a forward-declared type.
+// ---------------------------------------------------------------------------
+
+struct task_completion_awaiter {
+    engine* self;
+    std::size_t task_idx;
+
+    bool await_ready() const noexcept;
+    bool await_suspend(std::coroutine_handle<> h) noexcept;
+    void await_resume() const noexcept {}
+};
+
+// ---------------------------------------------------------------------------
+// task_handle — non-templated handle to a triggered task
+//
+// Defined BEFORE `engine` so the abstract base's templated
+// `trigger(Class&, task_uid)` wrapper can return a complete
+// `task_handle` (its body is parsed at the point of definition).
+// `done()` returns a `task_completion_awaiter` aggregate (complete at
+// this point).
+// ---------------------------------------------------------------------------
+
+struct task_handle {
+    engine* self;
+    std::size_t task_idx;
+    error err;
+
+    constexpr error error() const noexcept { return err; }
+
+    task_completion_awaiter done() const noexcept {
+        return {self, task_idx};
+    }
+};
+
+// ---------------------------------------------------------------------------
+// engine — abstract base class (interface)
+//
+// The non-trigger engine surface is virtual on this base so that engine
+// references can be passed around without the concrete `basic_engine<...>`
+// template parameters.  The concrete `basic_engine<...>` (below) publicly
+// inherits this class and provides the implementation.  Trigger methods
+// (templated and instance-based) remain on the concrete class only.
+//
+// Lifetime: derived destructors run before the base destructor, so a
+// `basic_engine` destroyed via `engine*` still cleans up its task handles.
+// ---------------------------------------------------------------------------
+
+class engine {
+public:
+    /// Concrete run loop: tick() + 1ms sleep, forever.
+    void run() {
+        for (;;) {
+            tick();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    virtual ~engine() = default;
+
+    // ----- non-trigger surface -----
+
+    /// Advance the engine by one tick (resume ready tasks, fire expired timers).
+    virtual void tick() = 0;
+
+    /// Static engine report (task count, pool sizes, etc.).
+    virtual engine_report report() const noexcept = 0;
+
+    /// Dump via Logger::print() (zero-cost no-op when Logger == no_logger).
+    virtual engine_report dump() const = 0;
+
+    /// Type-erased sink dump.  `sink` must be a captureless callable
+    /// invocable as `void(void*, std::string_view)`.  `ctx` is forwarded
+    /// as the first argument to every sink invocation.
+    virtual engine_report dump_erased(
+        void (*sink)(void*, std::string_view),
+        void* ctx) const = 0;
+
+    /// Type-erased sink wrapper.  Type-erases `sink` into a function
+    /// pointer + context, then calls `dump_erased`.  The sink lambda
+    /// must be captureless (function-pointer-convertible).
+    template <typename Sink>
+    engine_report dump(Sink&& sink) const {
+        using SinkT = std::remove_reference_t<Sink>;
+        auto trampoline = +[](void* ctx, std::string_view line) {
+            (*static_cast<SinkT*>(ctx))(line);
+        };
+        void* ctx = const_cast<void*>(static_cast<const void*>(&sink));
+        return dump_erased(trampoline, ctx);
+    }
+
+    /// True iff any task's probed frame size overflowed the reserved pool.
+    virtual bool pool_exhausted() const noexcept = 0;
+
+    /// True iff the task at `idx` is already finished (or unallocated).
+    virtual bool task_is_done(std::size_t idx) const noexcept = 0;
+
+    /// Register `h` as the single completion waiter for task `idx`.
+    /// Returns false if a waiter is already registered (caller does not suspend).
+    virtual bool register_completion_waiter(
+        std::size_t idx, std::coroutine_handle<> h) noexcept = 0;
+
+    // ----- UID-based trigger surface -----
+
+    /// Trigger a task by UID.  Non-blocking: returns immediately with
+    /// a `task_handle` whose `error()` indicates the result.
+    /// `task_not_registered` if the UID is not present in any instance.
+    virtual task_handle trigger(task_uid uid) = 0;
+
+    /// Type-safe wrapper: trigger a specific object's task by UID.
+    /// Walks the same probe chain as `trigger(uid)` and returns the
+    /// first slot whose `self` matches `&obj`.
+    template <typename Class>
+    task_handle trigger(Class& obj, task_uid uid) {
+        return trigger_obj(static_cast<void*>(std::addressof(obj)), uid);
+    }
+
+protected:
+    /// Type-erased instance trigger.  `trigger(Class&, task_uid)`
+    /// above casts `&obj` to `void*` and dispatches here.
+    virtual task_handle trigger_obj(void* obj, task_uid uid) = 0;
+
+    engine() = default;
+};
+
+// ---------------------------------------------------------------------------
+// task_completion_awaiter method bodies (out-of-line, after `engine` complete)
+// ---------------------------------------------------------------------------
+
+inline bool task_completion_awaiter::await_ready() const noexcept {
+    return self->task_is_done(task_idx);
+}
+
+inline bool task_completion_awaiter::await_suspend(
+    std::coroutine_handle<> h) noexcept {
+    return self->register_completion_waiter(task_idx, h);
+}
 
 /// Compile-time task-registering coroutine engine.
 template <typename Config, typename ClockType, typename Logger, typename... Entries>
-class engine {
+class basic_engine : public engine {
     static constexpr std::size_t num_tasks = sizeof...(Entries);
 
     // Function name storage (pointers to static constexpr strings)
@@ -142,6 +364,134 @@ class engine {
     static constexpr std::size_t scratch_unused = Config::scratchpad_pool_size;
 
     bool pool_overflow_ = false;
+
+    // -----------------------------------------------------------------------
+    // UID hashmap — open-addressing, linear probing, zero-heap
+    //
+    // Sized to next power of 2 ≥ 2 * num_tasks (load factor ≤ 50%).
+    // For 0 tasks the table has 1 entry which is never occupied; lookup
+    // always returns num_tasks (= 0).
+    //
+    // Built in `build_uid_table()` from `tasks_[i].uid` (filled by
+    // `init_uids()`).  Multi-instance registration produces linear
+    // probe chains — `find_slot_by_uid` returns the FIRST slot in the
+    // chain (the first registered instance, matching the NTTP-based
+    // trigger's behavior); `find_slot_by_uid_and_obj` walks the same
+    // chain and matches `self`.
+    // -----------------------------------------------------------------------
+
+    struct uid_entry {
+        std::uint32_t uid = 0;
+        std::size_t slot = 0;
+        bool occupied = false;
+    };
+
+    static constexpr std::size_t uid_table_size = detail::next_pow2(2 * num_tasks);
+    std::array<uid_entry, uid_table_size> uid_table_{};
+
+    void build_uid_table() noexcept {
+        const std::size_t mask = uid_table_size - 1;
+        for (std::size_t i = 0; i < num_tasks; ++i) {
+            std::uint32_t u = tasks_[i].uid;
+            std::size_t idx = u & mask;
+            while (uid_table_[idx].occupied) {
+                idx = (idx + 1) & mask;
+            }
+            uid_table_[idx] = {u, i, true};
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Single invoke table — O(1) slot→execute dispatch
+    //
+    // The UID→slot hashmap gives O(1) lookup of the slot index from a
+    // UID.  The invoke table then dispatches from slot index to the
+    // coroutine in O(1): index by `idx`, call the per-`I` thunk that
+    // returns a `task`.  The heavy method (execute_scratchpad,
+    // trigger_reserved_argfree, probe_frame_size) sets up the engine
+    // state, calls the thunk, and handles the returned handle.
+    //
+    // The thunk is the irreducible per-task call trampoline: it
+    // captures the entry's `fn` pointer + class type via the template
+    // parameter `I`, and dispatches member-vs-free + arg-free-guard
+    // via `if constexpr`.  Arg-taking fns return `task{}` (empty
+    // handle) as a sentinel; the caller detects and bails.
+    //
+    // The other per-I initializers (init_fn_names, init_uids,
+    // build_uid_table, init_flags) are trivial constexpr-data builders
+    // — this is the only per-I pack expansion that does real work.
+    // -----------------------------------------------------------------------
+
+    template <std::size_t I>
+    static task invoke_thunk(void* self_ptr) noexcept {
+        using entry_t = typename detail::type_at<I, Entries...>::type;
+        using fn_type = decltype(entry_t::fn);
+        if constexpr (std::is_member_function_pointer_v<fn_type>) {
+            using Class = typename entry_t::class_type;
+            auto* eng = static_cast<basic_engine*>(self_ptr);
+            auto* obj = static_cast<Class*>(eng->tasks_[I].self);
+            if constexpr (std::is_invocable_v<fn_type, Class*>) {
+                return (obj->*entry_t::fn)();
+            } else {
+                return task{};  // arg-taking fn: sentinel
+            }
+        } else {
+            if constexpr (std::is_invocable_v<fn_type>) {
+                return entry_t::fn();
+            } else {
+                return task{};  // arg-taking fn: sentinel
+            }
+        }
+    }
+
+    using invoke_fn = task (*)(void*);
+    std::array<invoke_fn, num_tasks> invoke_table_{};
+
+    void build_invoke_table() noexcept {
+        [this]<std::size_t... Is>(std::index_sequence<Is...>) {
+            ((invoke_table_[Is] = &invoke_thunk<Is>), ...);
+        }(std::make_index_sequence<num_tasks>{});
+    }
+
+    // init_flags() — set per-slot `is_scratchpad` from the compile-time
+    // entry descriptor.  Must run BEFORE probe_frame_sizes() (which reads
+    // it) and BEFORE dispatch_by_idx() (which routes by it).  Trivial
+    // per-I pack expansion: reads a constexpr bool and stores it.
+    template <std::size_t I>
+    static constexpr bool entry_is_scratchpad() noexcept {
+        return detail::type_at<I, Entries...>::type::is_scratchpad;
+    }
+    template <std::size_t... Is>
+    void init_flags_impl(std::index_sequence<Is...>) noexcept {
+        ((tasks_[Is].is_scratchpad = entry_is_scratchpad<Is>()), ...);
+    }
+    void init_flags() noexcept {
+        init_flags_impl(std::make_index_sequence<num_tasks>{});
+    }
+
+    std::size_t find_slot_by_uid(std::uint32_t u) const noexcept {
+        if (uid_table_size == 0) return num_tasks;
+        const std::size_t mask = uid_table_size - 1;
+        std::size_t idx = u & mask;
+        while (uid_table_[idx].occupied) {
+            if (uid_table_[idx].uid == u) return uid_table_[idx].slot;
+            idx = (idx + 1) & mask;
+        }
+        return num_tasks;
+    }
+
+    std::size_t find_slot_by_uid_and_obj(std::uint32_t u, void* obj) const noexcept {
+        if (uid_table_size == 0) return num_tasks;
+        const std::size_t mask = uid_table_size - 1;
+        std::size_t idx = u & mask;
+        while (uid_table_[idx].occupied) {
+            if (uid_table_[idx].uid == u && tasks_[uid_table_[idx].slot].self == obj) {
+                return uid_table_[idx].slot;
+            }
+            idx = (idx + 1) & mask;
+        }
+        return num_tasks;
+    }
 
     // -----------------------------------------------------------------------
     // Scratchpad bitmap allocator (16-byte blocks, first-fit)
@@ -207,47 +557,12 @@ class engine {
     // -----------------------------------------------------------------------
 
 public:
-    /// Awaiter returned by task_handle::done(). Suspends until the task
-    /// completes.  Only one waiter per task is supported; a second call
-    /// to done() while a waiter is registered returns false from
-    /// await_suspend (the caller does not suspend).
-    struct task_completion_awaiter {
-        engine* self;
-        std::size_t task_idx;
-
-        bool await_ready() const noexcept {
-            auto& meta = self->tasks_[task_idx];
-            return !meta.occupied || (meta.handle && meta.handle.done());
-        }
-
-        bool await_suspend(std::coroutine_handle<> h) noexcept {
-            auto& meta = self->tasks_[task_idx];
-            if (meta.has_completion_waiter) return false;
-            meta.completion_waiter = h;
-            meta.has_completion_waiter = true;
-            return true;
-        }
-
-        void await_resume() const noexcept {}
-    };
-
-    /// Handle returned by trigger() / try_trigger() for any task type.
-    /// Provides error() to check the result and done() to await completion.
-    struct task_handle {
-        engine* self;
-        std::size_t task_idx;
-        error err;
-
-        error error() const noexcept { return err; }
-
-        task_completion_awaiter done() const noexcept {
-            return {self, task_idx};
-        }
-    };
-
-    /// Awaiter returned by trigger() for scratchpad tasks.
+    /// Awaiter returned by trigger() for scratchpad tasks.  Stays a
+    /// nested type of `basic_engine` because it accesses private
+    /// members (e.g. `tasks_`, `scratchpad_waiter_count_`).  Its
+    /// `await_resume` returns the namespace-scope `task_handle`.
     struct scratchpad_trigger_awaiter {
-        engine* self;
+        basic_engine* self;
         std::size_t task_idx;
         std::coroutine_handle<> handle;
         bool allocated = false;
@@ -343,6 +658,15 @@ private:
             meta.has_completion_waiter = false;
             auto h = meta.completion_waiter;
             meta.completion_waiter = {};
+            // Clear the suspended flag on the waiting task before
+            // resuming it (register_completion_waiter set it to keep
+            // the direct-resume path at bay).  If the waiter
+            // suspends again on its own timer, the timer's resume
+            // path will set suspended=false as before.
+            std::size_t waiter_idx = find_slot_for_handle(h);
+            if (waiter_idx < num_tasks) {
+                tasks_[waiter_idx].suspended = false;
+            }
             h.resume();
         }
 
@@ -362,14 +686,133 @@ private:
 
     template <std::size_t... Is>
     static constexpr std::size_t count_scratchpad_impl(std::index_sequence<Is...>) {
-        return ((is_scratchpad_entry<Is>() ? std::size_t{1} : std::size_t{0}) + ...);
+        // Leading `std::size_t{0}` makes the fold well-formed for empty packs
+        // (e.g. an engine with zero tasks).  Pre-refactor this was masked
+        // because `report()` was non-virtual; the vtable generation now
+        // forces eager instantiation, exposing the empty-pack case.
+        return (std::size_t{0} + ... + (is_scratchpad_entry<Is>() ? std::size_t{1} : std::size_t{0}));
     }
     static constexpr std::size_t num_scratchpad = count_scratchpad_impl(std::make_index_sequence<num_tasks>{});
     static constexpr std::size_t num_reserved = num_tasks - num_scratchpad;
 
+    // -----------------------------------------------------------------------
+    // Compile-time distinctness check — O(N log N) sort+adjacent
+    //
+    // Equal UIDs are LEGAL only for the same function (multi-instance
+    // registration).  For distinct functions, equal UIDs are a FNV-1a
+    // hash collision, which is a hard error.
+    //
+    // Algorithm:
+    //   1. Collect N (uid, index) pairs into a constexpr array.
+    //   2. Sort by uid (constexpr insertion sort, O(N²) work in a
+    //      single constexpr function — one instantiation, cheap).
+    //      The KEY win vs the prior O(N²) pairwise check: the
+    //      number of TYPE INSTANTIATIONS drops to O(N) for the
+    //      adjacent check below, with each check O(log N) via
+    //      `detail::type_at` (divide-and-conquer std::tuple_element_t).
+    //   3. The adjacent check is only CORRECT after sorting: without
+    //      the sort, declaration-adjacent pairs are the only ones
+    //      compared, and non-adjacent collisions are silently missed.
+    //      Sorting groups equal UIDs together so the check catches
+    //      ALL equal-uid pairs.
+    //   4. For adjacent sorted entries, check: uid[i] == uid[i+1] ⇒
+    //      same fn.  Uses `detail::uid_pair_ok` for the predicate.
+    //
+    // Guarantee: equal UID ⇒ same fn; different-fn collision → hard
+    // error.
+    // -----------------------------------------------------------------------
+
+    // Each entry is (uid, original_index).  The original index is needed
+    // to look up the entry's `fn` at compile time for the adjacent check.
+    struct sorted_uid_entry {
+        std::uint32_t uid;
+        std::size_t index;
+        constexpr sorted_uid_entry() noexcept : uid(0), index(0) {}
+        constexpr sorted_uid_entry(std::uint32_t u, std::size_t i) noexcept
+            : uid(u), index(i) {}
+    };
+
+    template <std::size_t I>
+    static constexpr std::uint32_t entry_uid() noexcept {
+        // `fn` is a value (function pointer NTTP), not a type — so no `typename`.
+        return task_uid_v<detail::type_at<I, Entries...>::type::fn>.value;
+    }
+
+    template <std::size_t... Is>
+    static constexpr std::array<sorted_uid_entry, num_tasks>
+    collect_sorted_uids(std::index_sequence<Is...>) {
+        // Collect (uid, index) pairs.
+        std::array<sorted_uid_entry, num_tasks> arr = {{
+            sorted_uid_entry{entry_uid<Is>(), Is}...
+        }};
+        // Constexpr insertion sort by uid (ties broken by index for
+        // stability).  Sorting groups equal UIDs together so the
+        // adjacent check below catches all equal-uid pairs.
+        for (std::size_t i = 1; i < num_tasks; ++i) {
+            sorted_uid_entry key = arr[i];
+            std::size_t j = i;
+            while (j > 0 && (arr[j - 1].uid > key.uid ||
+                             (arr[j - 1].uid == key.uid &&
+                              arr[j - 1].index > key.index))) {
+                arr[j] = arr[j - 1];
+                --j;
+            }
+            arr[j] = key;
+        }
+        return arr;
+    }
+
+    static constexpr std::array<sorted_uid_entry, num_tasks> sorted_uids_ =
+        collect_sorted_uids(std::make_index_sequence<num_tasks>{});
+
+    // Check adjacent pair: if uids match, fns must match.
+    template <std::size_t I>
+    static constexpr bool check_sorted_adjacent() {
+        if constexpr (I + 1 >= num_tasks) {
+            return true;
+        } else {
+            constexpr auto ui = sorted_uids_[I].uid;
+            constexpr auto uj = sorted_uids_[I + 1].uid;
+            constexpr auto idx_i = sorted_uids_[I].index;
+            constexpr auto idx_j = sorted_uids_[I + 1].index;
+            using entry_i = typename detail::type_at<idx_i, Entries...>::type;
+            using entry_j = typename detail::type_at<idx_j, Entries...>::type;
+            // Function pointer comparison is only valid when the types
+            // match.  Different fn types → different fns → same=false.
+            if constexpr (std::is_same_v<decltype(entry_i::fn),
+                                         decltype(entry_j::fn)>) {
+                constexpr bool same = (entry_i::fn == entry_j::fn);
+                return detail::uid_pair_ok(ui, uj, same);
+            } else {
+                return detail::uid_pair_ok(ui, uj, false);
+            }
+        }
+    }
+
+    // O(N) fold over adjacent checks.  For num_tasks==0 the fold is
+    // `(true && ...)` which is well-defined (empty pack → true).
+    template <std::size_t... Is>
+    static constexpr bool check_all_sorted_adjacent(std::index_sequence<Is...>) {
+        return (check_sorted_adjacent<Is>() && ... && true);
+    }
+
+    static_assert(
+        check_all_sorted_adjacent(std::make_index_sequence<num_tasks>{}),
+        "Duplicate task UIDs for different functions (FNV-1a hash collision). "
+        "Equal UIDs are allowed only for the same function (multi-instance).");
+
     void init_fn_names() {
         [this]<std::size_t... Is>(std::index_sequence<Is...>) {
             ((fn_names_[Is] = detail::format_tag<Entries::fn>()), ...);
+        }(std::make_index_sequence<num_tasks>{});
+    }
+
+    // Fill `task_meta::uid` per slot.  Mirrors `init_fn_names()`'s
+    // structure: a single pack-expansion lambda iterates each entry in
+    // declaration order and writes its UID into `tasks_[I].uid`.
+    void init_uids() {
+        [this]<std::size_t... Is>(std::index_sequence<Is...>) {
+            ((tasks_[Is].uid = task_uid_v<Entries::fn>.value), ...);
         }(std::make_index_sequence<num_tasks>{});
     }
 
@@ -391,11 +834,11 @@ private:
     static error timer_registrar_add(void* ctx,
                                       std::chrono::steady_clock::time_point wake,
                                       std::coroutine_handle<> h) noexcept {
-        return static_cast<engine*>(ctx)->add_timer(wake, h);
+        return static_cast<basic_engine*>(ctx)->add_timer(wake, h);
     }
 
     static void mark_suspended(void* ctx, std::coroutine_handle<> h) noexcept {
-        auto* self = static_cast<engine*>(ctx);
+        auto* self = static_cast<basic_engine*>(ctx);
         for (auto& t : self->tasks_) {
             if (t.handle && t.handle.address() == h.address()) {
                 t.suspended = true;
@@ -417,48 +860,48 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // Scratchpad coroutine creation (compile-time dispatch for runtime index)
+    // Scratchpad coroutine creation — single method, runtime slot idx
+    //
+    // Uses the invoke_table_ thunk to call the coroutine, reads
+    // per-slot state from `tasks_[idx]`.  No template parameter, no
+    // per-I instantiation.  Called only for scratchpad slots (by
+    // `try_scratchpad` and `try_resume_waiter`).
     // -----------------------------------------------------------------------
 
-    template <std::size_t I>
-    void execute_scratchpad_at(std::size_t alloc) {
-        using entry_t = typename detail::type_at<I, Entries...>::type;
-        if constexpr (entry_t::is_scratchpad) {
-            auto& meta = tasks_[I];
-            meta.scratch_offset = alloc;
-            if (meta.handle) { meta.handle.destroy(); meta.handle = {}; }
+    void execute_scratchpad(std::size_t idx, std::size_t alloc) noexcept {
+        auto& meta = tasks_[idx];
+        meta.scratch_offset = alloc;
+        if (meta.handle) { meta.handle.destroy(); meta.handle = {}; }
 
-            detail::current_task_allocator = {&scratchpad_pool_[alloc], meta.size, nullptr};
-            detail::current_timer_registrar = {&timer_registrar_add, this};
-            detail::current_external_suspension_registrar = {&mark_suspended, this};
-            meta.suspended = false;
-            meta.occupied = true;
+        detail::current_task_allocator = {&scratchpad_pool_[alloc], meta.size, nullptr};
+        detail::current_timer_registrar = {&timer_registrar_add, this};
+        detail::current_external_suspension_registrar = {&mark_suspended, this};
+        meta.suspended = false;
+        meta.occupied = true;
 
-            using fn_type = decltype(entry_t::fn);
-            if constexpr (std::is_member_function_pointer_v<fn_type>) {
-                using Class = typename entry_t::class_type;
-                auto* obj = static_cast<Class*>(meta.self);
-                meta.handle = (obj->*entry_t::fn)().handle();
-            } else {
-                meta.handle = entry_t::fn().handle();
-            }
-            meta.handle.resume();
+        // Thunk returns a task; if it returns an empty task (arg-taking
+        // fn), the slot is already marked occupied above — undo that
+        // and bail.  In practice, scratchpad thunks always succeed
+        // (arg-taking fns can't be scratchpad tasks).
+        task t = invoke_table_[idx](this);
+        if (!t) {
+            meta.occupied = false;
+            meta.suspended = true;
             detail::current_external_suspension_registrar = {};
             detail::current_timer_registrar = {};
-
-            if (meta.handle.done()) {
-                complete_task(I);
-            }
-
-            log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
-                "INF", fn_names_[I], "scratchpad triggered");
+            return;
         }
-    }
+        meta.handle = t.handle();
+        meta.handle.resume();
+        detail::current_external_suspension_registrar = {};
+        detail::current_timer_registrar = {};
 
-    void execute_scratchpad(std::size_t idx, std::size_t alloc) {
-        [this, idx, alloc]<std::size_t... Is>(std::index_sequence<Is...>) {
-            ((idx == Is ? (execute_scratchpad_at<Is>(alloc), 0) : 0), ...);
-        }(std::make_index_sequence<num_tasks>{});
+        if (meta.handle.done()) {
+            complete_task(idx);
+        }
+
+        log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
+            "INF", fn_names_[idx], "scratchpad triggered");
     }
 
     std::array<timer_entry, Config::max_timers> timers_{};
@@ -471,6 +914,9 @@ private:
     template <std::size_t I, typename... Args>
     error trigger_reserved(Args&&... args) {
         auto& meta = tasks_[I];
+
+        using entry_t = typename detail::type_at<I, Entries...>::type;
+        using fn_type = decltype(entry_t::fn);
 
         if (pool_overflow_) {
             log::detail::log_impl<Config, log_level::error, Logger, ClockType>(
@@ -491,14 +937,26 @@ private:
         detail::current_external_suspension_registrar = {&mark_suspended, this};
         meta.suspended = false;
 
-        using entry_t = typename detail::type_at<I, Entries...>::type;
-        using fn_type = decltype(entry_t::fn);
+        // Arg-free guard: the interface `trigger(task_uid)` calls
+        // this with no args (`Args = {}`).  The actual call below is
+        // wrapped in an invocability check so arg-taking fns return
+        // `task_not_registered` instead of failing to compile.  The
+        // templated `trigger<Fn>(args...)` on `basic_engine` supplies
+        // matching `Args...` and always takes the call branch.
         if constexpr (std::is_member_function_pointer_v<fn_type>) {
             using Class = typename entry_t::class_type;
             auto* obj = static_cast<Class*>(meta.self);
-            meta.handle = (obj->*entry_t::fn)(std::forward<Args>(args)...).handle();
+            if constexpr (std::is_invocable_v<fn_type, Class*, Args...>) {
+                meta.handle = (obj->*entry_t::fn)(std::forward<Args>(args)...).handle();
+            } else {
+                return error::task_not_registered;
+            }
         } else {
-            meta.handle = entry_t::fn(std::forward<Args>(args)...).handle();
+            if constexpr (std::is_invocable_v<fn_type, Args...>) {
+                meta.handle = entry_t::fn(std::forward<Args>(args)...).handle();
+            } else {
+                return error::task_not_registered;
+            }
         }
 
         meta.handle.resume();
@@ -559,22 +1017,87 @@ private:
         return {this, idx, error::ok};
     }
 
-public:
-    engine() = delete;
+    // -----------------------------------------------------------------------
+    // Runtime-index arg-free reserved trigger
+    //
+    // Uses the invoke_table_ thunk to call the coroutine arg-free.
+    // If the thunk returns an empty task (arg-taking fn sentinel),
+    // returns `error::task_not_registered`.  Called only for reserved
+    // slots (by `dispatch_by_idx`).
+    // -----------------------------------------------------------------------
 
-    engine(std::array<void*, num_tasks> self_ptrs) : tasks_{} {
+    error trigger_reserved_argfree(std::size_t idx) noexcept {
+        auto& meta = tasks_[idx];
+        if (pool_overflow_) {
+            log::detail::log_impl<Config, log_level::error, Logger, ClockType>(
+                "ERR", fn_names_[idx], "reserved pool exhausted");
+            return error::capacity_exceeded;
+        }
+        if (meta.occupied) {
+            log::detail::log_impl<Config, log_level::warn, Logger, ClockType>(
+                "WRN", fn_names_[idx], "already running");
+            return error::task_already_running;
+        }
+        if (meta.handle) { meta.handle.destroy(); meta.handle = {}; }
+
+        detail::current_task_allocator = {&pool_[meta.offset], meta.size, nullptr};
+        detail::current_timer_registrar = {&timer_registrar_add, this};
+        detail::current_external_suspension_registrar = {&mark_suspended, this};
+        meta.suspended = false;
+
+        // Thunk returns a task; empty task = arg-taking fn.
+        task t = invoke_table_[idx](this);
+        if (!t) {
+            detail::current_external_suspension_registrar = {};
+            detail::current_timer_registrar = {};
+            return error::task_not_registered;
+        }
+        meta.handle = t.handle();
+        meta.handle.resume();
+        detail::current_external_suspension_registrar = {};
+        detail::current_timer_registrar = {};
+
+        if (meta.handle.done()) {
+            complete_task(idx);
+        } else {
+            meta.occupied = true;
+        }
+
+        log::detail::log_impl<Config, log_level::info, Logger, ClockType>(
+            "INF", fn_names_[idx], "triggered");
+        return error::ok;
+    }
+
+    /// Dispatch by runtime index: scratchpad → try_scratchpad;
+    /// reserved → trigger_reserved_argfree.  Caller must have already
+    /// verified `idx < num_tasks`.
+    task_handle dispatch_by_idx(std::size_t idx) noexcept {
+        if (tasks_[idx].is_scratchpad) {
+            return try_scratchpad(idx);
+        }
+        return {this, idx, trigger_reserved_argfree(idx)};
+    }
+
+public:
+    basic_engine() = delete;
+
+    basic_engine(std::array<void*, num_tasks> self_ptrs) : tasks_{} {
         for (std::size_t i = 0; i < num_tasks; ++i) {
             tasks_[i].self = self_ptrs[i];
             tasks_[i].scratch_offset = scratch_unused;
         }
         init_fn_names();
+        init_uids();
+        build_uid_table();
+        build_invoke_table();
+        init_flags();
         probe_frame_sizes();
     }
 
-    engine(const engine&) = delete;
-    engine& operator=(const engine&) = delete;
+    basic_engine(const basic_engine&) = delete;
+    basic_engine& operator=(const basic_engine&) = delete;
 
-    ~engine() {
+    ~basic_engine() {
         for (auto& meta : tasks_) {
             if (meta.handle) meta.handle.destroy();
         }
@@ -672,7 +1195,11 @@ public:
         }
     }
 
-    engine_report report() const noexcept {
+    // -------------------------------------------------------------------
+    // engine interface overrides
+    // -------------------------------------------------------------------
+
+    engine_report report() const noexcept override {
         engine_report r{};
         r.task_count = num_tasks;
         r.reserved_count = num_reserved;
@@ -681,118 +1208,174 @@ public:
         return r;
     }
 
+    // Compile-time engine report.  All fields are constexpr from
+    // `Config` + `sizeof...(Entries)`.  Usable in static_assert and
+    // deployment-time prints.  NO frame sizes (coroutines aren't
+    // constexpr in C++20).
+    static constexpr engine_static_report static_report() noexcept {
+        return engine_static_report{
+            sizeof...(Entries),
+            num_reserved,
+            num_scratchpad,
+            Config::reserved_pool_size,
+            Config::scratchpad_pool_size,
+            Config::max_timers
+        };
+    }
+
     /// Dump via Logger::print().
-    engine_report dump() const {
+    engine_report dump() const override {
         auto r = report();
         dump_pool_summary_log();
         dump_scratchpad_summary_log();
-        [this]<std::size_t... Is>(std::index_sequence<Is...>) {
-            ((dump_one_line_log<Is>()), ...);
-        }(std::make_index_sequence<num_tasks>{});
+        for (std::size_t i = 0; i < num_tasks; ++i) {
+            dump_one_line_log(i);
+        }
         return r;
     }
 
-    /// Dump via custom sink.
+    /// Type-erased sink dump.  Dispatches to the erased helpers below.
+    engine_report dump_erased(void (*sink)(void*, std::string_view),
+                              void* ctx) const override {
+        auto r = report();
+        dump_pool_summary_sink_erased(sink, ctx);
+        dump_scratchpad_summary_sink_erased(sink, ctx);
+        for (std::size_t i = 0; i < num_tasks; ++i) {
+            dump_one_line_sink_erased(i, sink, ctx);
+        }
+        return r;
+    }
+
+    /// Dump via custom sink (templated; can accept capturing lambdas).
+    /// Coexists with the base class's templated `dump<Sink>` wrapper.
     template <typename Sink>
     engine_report dump(Sink&& sink) const {
         auto r = report();
         dump_pool_summary_sink(sink);
         dump_scratchpad_summary_sink(sink);
-        [this, &sink]<std::size_t... Is>(std::index_sequence<Is...>) {
-            ((dump_one_line_sink<Is>(sink)), ...);
-        }(std::make_index_sequence<num_tasks>{});
+        for (std::size_t i = 0; i < num_tasks; ++i) {
+            dump_one_line_sink(i, sink);
+        }
         return r;
+    }
+
+    bool pool_exhausted() const noexcept override { return pool_overflow_; }
+
+    bool task_is_done(std::size_t idx) const noexcept override {
+        // OOB guard: a `task_handle` constructed with `idx = num_tasks`
+        // (returned by `trigger(uid)` for an unregistered UID) calls
+        // this with OOB idx.  Treat OOB as "done" so `co_await h.done()`
+        // returns immediately instead of reading past `tasks_`.
+        if (idx >= num_tasks) return true;
+        auto& meta = tasks_[idx];
+        return !meta.occupied || (meta.handle && meta.handle.done());
+    }
+
+    bool register_completion_waiter(std::size_t idx,
+                                    std::coroutine_handle<> h) noexcept override {
+        // Same OOB guard as `task_is_done`; don't suspend on bad idx.
+        if (idx >= num_tasks) return false;
+        auto& meta = tasks_[idx];
+        if (meta.has_completion_waiter) return false;
+        meta.completion_waiter = h;
+        meta.has_completion_waiter = true;
+        // Mark the WAITING task as suspended so the direct-resume
+        // path in tick() does not incorrectly resume it.  The
+        // completion-wait contract: the waiter is only resumed when
+        // complete_task() fires for the waitee.
+        std::size_t waiter_idx = find_slot_for_handle(h);
+        if (waiter_idx < num_tasks) {
+            tasks_[waiter_idx].suspended = true;
+        }
+        return true;
+    }
+
+    // -------------------------------------------------------------------
+    // UID-based trigger overrides
+    // -------------------------------------------------------------------
+
+    task_handle trigger(task_uid uid) override {
+        std::size_t idx = find_slot_by_uid(uid.value);
+        if (idx >= num_tasks) {
+            return {this, num_tasks, error::task_not_registered};
+        }
+        return dispatch_by_idx(idx);
+    }
+
+    task_handle trigger_obj(void* obj, task_uid uid) override {
+        std::size_t idx = find_slot_by_uid_and_obj(uid.value, obj);
+        if (idx >= num_tasks) {
+            return {this, num_tasks, error::task_not_registered};
+        }
+        return dispatch_by_idx(idx);
     }
 
 private:
     // -----------------------------------------------------------------------
-    // Frame-size probing
+    // Frame-size probing — single method, runtime slot idx
+    //
+    // Reads `tasks_[idx].is_scratchpad` (set by `init_flags()`) and
+    // uses the invoke_table_ thunk to call the coroutine for probing.
+    // The thunk's arg-free guard handles arg-taking tasks (returns
+    // empty task → falls back to `default_frame_size`).
     // -----------------------------------------------------------------------
 
     void probe_frame_sizes() {
         std::size_t current_offset = 0;
-        [this, &current_offset]<std::size_t... Is>(std::index_sequence<Is...>) {
-            ((probe_frame_size<Is>(current_offset)), ...);
-        }(std::make_index_sequence<num_tasks>{});
+        for (std::size_t i = 0; i < num_tasks; ++i) {
+            probe_frame_size(i, current_offset);
+        }
     }
 
-    template <std::size_t I>
-    void probe_frame_size(std::size_t& current_offset) {
-        using entry_t = typename detail::type_at<I, Entries...>::type;
-        using fn_type = std::remove_cv_t<decltype(entry_t::fn)>;
-        tasks_[I].is_scratchpad = entry_t::is_scratchpad;
+    void probe_frame_size(std::size_t idx, std::size_t& current_offset) {
+        auto& meta = tasks_[idx];
+        constexpr std::size_t min_probe_space = 64;
 
-        if constexpr (entry_t::is_scratchpad) {
-            tasks_[I].offset = 0;
-            if (pool_overflow_) { tasks_[I].size = 0; return; }
+        if (meta.is_scratchpad) {
+            meta.offset = 0;
+            if (pool_overflow_) { meta.size = 0; return; }
             std::size_t remaining = Config::reserved_pool_size - current_offset;
-            constexpr std::size_t min_probe_space = 64;
             bool probed = false;
             if (remaining >= min_probe_space) {
-                if constexpr (std::is_member_function_pointer_v<fn_type>) {
-                    using Class = typename entry_t::class_type;
-                    auto* obj = static_cast<Class*>(tasks_[I].self);
-                    if constexpr (std::is_invocable_v<fn_type, Class*>) {
-                        if (obj) {
-                            detail::current_task_allocator = {&pool_[current_offset], remaining, &tasks_[I].size};
-                            { task t = (obj->*entry_t::fn)(); t.handle().destroy(); }
-                            detail::current_task_allocator = {};
-                            probed = true;
-                        }
-                    }
-                } else {
-                    if constexpr (std::is_invocable_v<fn_type>) {
-                        detail::current_task_allocator = {&pool_[current_offset], remaining, &tasks_[I].size};
-                        { task t = entry_t::fn(); t.handle().destroy(); }
-                        detail::current_task_allocator = {};
-                        probed = true;
-                    }
+                detail::current_task_allocator = {&pool_[current_offset], remaining, &meta.size};
+                task t = invoke_table_[idx](this);
+                if (t) {
+                    t.handle().destroy();
+                    probed = true;
                 }
+                detail::current_task_allocator = {};
             }
-            if (!probed) tasks_[I].size = detail::default_frame_size;
+            if (!probed) meta.size = detail::default_frame_size;
             return;
         }
 
         // Reserved task
-        if (pool_overflow_) { tasks_[I].offset = 0; tasks_[I].size = 0; return; }
+        if (pool_overflow_) { meta.offset = 0; meta.size = 0; return; }
         current_offset = (current_offset + alignof(std::max_align_t) - 1) & ~(alignof(std::max_align_t) - 1);
-        tasks_[I].offset = current_offset;
+        meta.offset = current_offset;
         std::size_t remaining = Config::reserved_pool_size - current_offset;
-        constexpr std::size_t min_probe_space = 64;
         bool can_probe = (remaining >= min_probe_space);
         bool probed = false;
         if (can_probe) {
-            if constexpr (std::is_member_function_pointer_v<fn_type>) {
-                using Class = typename entry_t::class_type;
-                auto* obj = static_cast<Class*>(tasks_[I].self);
-                if constexpr (std::is_invocable_v<fn_type, Class*>) {
-                    if (obj) {
-                        detail::current_task_allocator = {&pool_[current_offset], remaining, &tasks_[I].size};
-                        { task t = (obj->*entry_t::fn)(); t.handle().destroy(); }
-                        detail::current_task_allocator = {};
-                        probed = true;
-                    }
-                }
-            } else {
-                if constexpr (std::is_invocable_v<fn_type>) {
-                    detail::current_task_allocator = {&pool_[current_offset], remaining, &tasks_[I].size};
-                    { task t = entry_t::fn(); t.handle().destroy(); }
-                    detail::current_task_allocator = {};
-                    probed = true;
-                }
+            detail::current_task_allocator = {&pool_[current_offset], remaining, &meta.size};
+            task t = invoke_table_[idx](this);
+            if (t) {
+                t.handle().destroy();
+                probed = true;
             }
+            detail::current_task_allocator = {};
         }
-        if (!probed) tasks_[I].size = detail::default_frame_size;
-        current_offset += tasks_[I].size;
+        if (!probed) meta.size = detail::default_frame_size;
+        current_offset += meta.size;
         if (current_offset > Config::reserved_pool_size) {
             pool_overflow_ = true;
-            tasks_[I].offset = 0;
-            tasks_[I].size = 0;
+            meta.offset = 0;
+            meta.size = 0;
         }
     }
 
     // -----------------------------------------------------------------------
-    // Dump helpers
+    // Dump helpers — templated (used by basic_engine::dump<Sink>)
     // -----------------------------------------------------------------------
 
     void dump_pool_summary_log() const {
@@ -813,7 +1396,10 @@ private:
         char line[256];
         int n = std::snprintf(line, sizeof(line), "Reserved pool: %zuB / %zuB used (%.1f%%)",
                               used, static_cast<std::size_t>(Config::reserved_pool_size), pct);
-        if (n > 0) sink(std::string_view(line, static_cast<std::size_t>(n)));
+        if (n > 0) {
+            std::string_view sv{line, static_cast<std::size_t>(n)};
+            sink(sv);
+        }
     }
 
     void dump_scratchpad_summary_log() const {
@@ -844,46 +1430,114 @@ private:
                               "Scratchpad pool: %zuB / %zuB used (%.1f%%), waiters: %zu",
                               used_bytes, static_cast<std::size_t>(Config::scratchpad_pool_size),
                               pct, scratchpad_waiter_count_);
-        if (n > 0) sink(std::string_view(line, static_cast<std::size_t>(n)));
-    }
-
-    template <std::size_t I>
-    void dump_one_line_log() const {
-        using entry_t = typename detail::type_at<I, Entries...>::type;
-        const auto& meta = tasks_[I];
-        if constexpr (entry_t::is_scratchpad) {
-            char line[256];
-            std::snprintf(line, sizeof(line), "[%zu] <%s>  scratchpad  size=%zuB",
-                          I, fn_names_[I], meta.size);
-            log::detail::log_impl<Config, log_level::info, Logger, ClockType>("INF", fn_names_[I], "%s", line);
-        } else {
-            char line[256];
-            std::snprintf(line, sizeof(line), "[%zu] <%s>  reserved  offset=%zu  size=%zuB",
-                          I, fn_names_[I], meta.offset, meta.size);
-            log::detail::log_impl<Config, log_level::info, Logger, ClockType>("INF", fn_names_[I], "%s", line);
+        if (n > 0) {
+            std::string_view sv{line, static_cast<std::size_t>(n)};
+            sink(sv);
         }
     }
 
-    template <std::size_t I, typename Sink>
-    void dump_one_line_sink(Sink& sink) const {
-        using entry_t = typename detail::type_at<I, Entries...>::type;
-        const auto& meta = tasks_[I];
+    // One non-templated method per dump kind.  Reads per-slot
+    // `is_scratchpad` (runtime, set by init_flags()) and `fn_names_[i]`
+    // from the data arrays.
+    void dump_one_line_log(std::size_t i) const {
+        const auto& meta = tasks_[i];
+        char line[256];
+        if (meta.is_scratchpad) {
+            std::snprintf(line, sizeof(line), "[%zu] <%s>  scratchpad  size=%zuB",
+                          i, fn_names_[i], meta.size);
+        } else {
+            std::snprintf(line, sizeof(line), "[%zu] <%s>  reserved  offset=%zu  size=%zuB",
+                          i, fn_names_[i], meta.offset, meta.size);
+        }
+        log::detail::log_impl<Config, log_level::info, Logger, ClockType>("INF", fn_names_[i], "%s", line);
+    }
+
+    template <typename Sink>
+    void dump_one_line_sink(std::size_t i, Sink& sink) const {
+        const auto& meta = tasks_[i];
         char line[256];
         int n;
-        if constexpr (entry_t::is_scratchpad) {
+        if (meta.is_scratchpad) {
             n = std::snprintf(line, sizeof(line), "[%zu] <%s>  scratchpad  size=%zuB",
-                              I, fn_names_[I], meta.size);
+                              i, fn_names_[i], meta.size);
         } else {
             n = std::snprintf(line, sizeof(line), "[%zu] <%s>  reserved  offset=%zu  size=%zuB",
-                              I, fn_names_[I], meta.offset, meta.size);
+                              i, fn_names_[i], meta.offset, meta.size);
         }
-        if (n > 0) sink(std::string_view(line, static_cast<std::size_t>(n)));
+        if (n > 0) {
+            std::string_view sv{line, static_cast<std::size_t>(n)};
+            sink(sv);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Dump helpers — type-erased (used by dump_erased)
+    // -----------------------------------------------------------------------
+
+    void dump_pool_summary_sink_erased(
+            void (*sink)(void*, std::string_view), void* ctx) const {
+        std::size_t used = total_pool_used();
+        double pct = Config::reserved_pool_size > 0
+            ? (static_cast<double>(used) / Config::reserved_pool_size) * 100.0 : 0.0;
+        char line[256];
+        int n = std::snprintf(line, sizeof(line), "Reserved pool: %zuB / %zuB used (%.1f%%)",
+                              used, static_cast<std::size_t>(Config::reserved_pool_size), pct);
+        if (n > 0) {
+            // Local variable avoids the constrained `string_view(It, End)`
+            // overload (a libstdc++ 14 / GCC 14 bug: it instantiates its
+            // noexcept expression before the function is defined when the
+            // construction appears in an eagerly-instantiated context such
+            // as a virtual override).  Construction of the local picks the
+            // simple `(const char*, size_t)` overload.
+            std::string_view sv{line, static_cast<std::size_t>(n)};
+            sink(ctx, sv);
+        }
+    }
+
+    void dump_scratchpad_summary_sink_erased(
+            void (*sink)(void*, std::string_view), void* ctx) const {
+        std::size_t used_blocks = 0;
+        for (auto word : scratchpad_bitmap_)
+            used_blocks += static_cast<std::size_t>(__builtin_popcountll(word));
+        std::size_t used_bytes = used_blocks * scratchpad_block_size;
+        double pct = Config::scratchpad_pool_size > 0
+            ? (static_cast<double>(used_bytes) / Config::scratchpad_pool_size) * 100.0 : 0.0;
+        char line[256];
+        int n = std::snprintf(line, sizeof(line),
+                              "Scratchpad pool: %zuB / %zuB used (%.1f%%), waiters: %zu",
+                              used_bytes, static_cast<std::size_t>(Config::scratchpad_pool_size),
+                              pct, scratchpad_waiter_count_);
+        if (n > 0) {
+            std::string_view sv{line, static_cast<std::size_t>(n)};
+            sink(ctx, sv);
+        }
+    }
+
+    // One non-templated type-erased dump helper.  The sink callback
+    // and its context are passed through directly (no capture).
+    void dump_one_line_sink_erased(
+            std::size_t i,
+            void (*sink)(void*, std::string_view), void* ctx) const {
+        const auto& meta = tasks_[i];
+        char line[256];
+        int n;
+        if (meta.is_scratchpad) {
+            n = std::snprintf(line, sizeof(line), "[%zu] <%s>  scratchpad  size=%zuB",
+                              i, fn_names_[i], meta.size);
+        } else {
+            n = std::snprintf(line, sizeof(line), "[%zu] <%s>  reserved  offset=%zu  size=%zuB",
+                              i, fn_names_[i], meta.offset, meta.size);
+        }
+        if (n > 0) {
+            std::string_view sv{line, static_cast<std::size_t>(n)};
+            sink(ctx, sv);
+        }
     }
 
 public:
 
     /// Resume expired timers and their associated coroutines.
-    void tick() {
+    void tick() override {
         detail::current_timer_registrar = {&timer_registrar_add, this};
         detail::current_external_suspension_registrar = {&mark_suspended, this};
 
@@ -896,6 +1550,16 @@ public:
         }
 
         // (a) Resume directly-runnable tasks.
+        //
+        // A task is "directly runnable" iff it is occupied, its
+        // coroutine handle is not done, it has not been marked
+        // suspended (by `mark_suspended` for external events, or by
+        // `register_completion_waiter` for completion-wait), and it
+        // is NOT waiting on a timer.  The suspended flag is the
+        // single source of truth for "this task is waiting on
+        // something the engine should not resume directly here";
+        // completion-wait suspends the waiting task, timer-waits are
+        // detected below via `has_timer`.
         for (std::size_t i = 0; i < num_tasks; ++i) {
             auto& meta = tasks_[i];
             if (meta.occupied && meta.handle && !meta.handle.done() && !meta.suspended) {
@@ -944,12 +1608,6 @@ public:
         detail::current_external_suspension_registrar = {};
         detail::current_timer_registrar = {};
     }
-
-    void run() {
-        for (;;) { tick(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
-    }
-
-    bool pool_exhausted() const noexcept { return pool_overflow_; }
 };
 
 // ---------------------------------------------------------------------------

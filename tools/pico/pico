@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""pico — agent-verifiable RP2040 (Pico) flash + serial tool.
+
+Wraps picotool and raw termios serial I/O so an agent (or human) can
+flash firmware and capture USB CDC output without manual BOOTSEL button
+presses or hand-written capture scripts.
+
+Subcommands:
+  info                 Show connected device state (picotool info).
+  flash <uf2>          Load a .uf2 onto the connected Pico.
+  reboot [app|bootsel] Reboot the device (default: app).
+  serial [-t SEC]      Read USB CDC output (live; -t stops after SEC idle).
+  run <uf2> [-t SEC]   flash + capture serial from boot (one-shot output).
+
+Stdlib only (os-level serial I/O via termios + select; no pyserial).
+Requires: picotool on PATH, a Pico connected via USB.
+
+Exit codes: 0 success, 1 usage, 2 device/tool error.
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+import select
+import subprocess
+import sys
+import termios
+import threading
+import time
+from datetime import datetime
+
+TTY_GLOB = "/dev/cu.usbmodem*"
+BAUD = termios.B115200
+LOG_DIR = ".tmp/serial_logs"
+
+
+def save_log(command: str, data: str) -> str | None:
+    """Append a capture to .tmp/serial_logs/<ts>_<command>.log. Returns path."""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(LOG_DIR, f"{ts}_{command}.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(data)
+        return path
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def die(msg: str, code: int = 2) -> "None":
+    print(f"pico: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def find_tty() -> str | None:
+    devs = glob.glob(TTY_GLOB)
+    return devs[0] if devs else None
+
+
+def have_picotool() -> bool:
+    try:
+        subprocess.run(["picotool", "version"], capture_output=True, check=False)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def run_picotool(args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(["picotool", *args], capture_output=True, text=True)
+
+
+def open_serial(dev: str) -> int:
+    """Open a tty as a raw 115200 8N1 non-blocking fd."""
+    fd = os.open(dev, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    attrs = termios.tcgetattr(fd)
+    attrs[4] = BAUD          # input speed
+    attrs[5] = BAUD          # output speed
+    attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL  # cflag
+    attrs[0] = 0             # iflag
+    attrs[1] = 0             # oflag
+    attrs[3] = 0             # lflag
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    termios.tcflush(fd, termios.TCIOFLUSH)
+    return fd
+
+
+def read_serial(dev: str, idle_timeout: float | None, total_timeout: float | None,
+                out=sys.stdout, log_command: str | None = None) -> int:
+    """Read from `dev` until idle/total timeout or Ctrl-C. Returns bytes read.
+    If log_command is set, also tee captured output to .tmp/serial_logs/."""
+    try:
+        fd = open_serial(dev)
+    except OSError as e:
+        die(f"cannot open {dev}: {e}")
+    n = 0
+    start = time.monotonic()
+    last = start
+    logf = None
+    if log_command:
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            logpath = os.path.join(LOG_DIR, f"{ts}_{log_command}.log")
+            logf = open(logpath, "w", encoding="utf-8")
+            print(f"pico: saving log to {logpath}", file=sys.stderr)
+        except OSError:
+            logf = None
+    try:
+        while True:
+            if total_timeout is not None and time.monotonic() - start > total_timeout:
+                break
+            if idle_timeout is not None and time.monotonic() - last > idle_timeout:
+                break
+            timeout = 0.3
+            if idle_timeout is not None:
+                timeout = min(0.3, max(0.05, idle_timeout - (time.monotonic() - last)))
+            r, _, _ = select.select([fd], [], [], timeout)
+            if r:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                text = data.decode(errors="replace")
+                out.write(text)
+                out.flush()
+                if logf:
+                    logf.write(text)
+                    logf.flush()
+                n += len(data)
+                last = time.monotonic()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        os.close(fd)
+        if logf:
+            logf.close()
+    return n
+
+
+# ---------------------------------------------------------------------------
+# subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_info(force: bool = False) -> int:
+    # Non-disruptive by default: `picotool info` only queries BOOTSEL-mode
+    # devices. `--force` uses `-f` which reboots a serial-mode device to
+    # query it (disruptive — the app restarts).
+    args = ["info"] + (["-f"] if force else [])
+    r = run_picotool(args)
+    print(r.stdout, end="")
+    if r.stderr:
+        print(r.stderr, end="", file=sys.stderr)
+    dev = find_tty()
+    if dev:
+        print(f"pico: CDC serial at {dev} (app running)")
+    elif not force:
+        print("pico: no CDC serial device (BOOTSEL mode, or no app running)")
+    return 0
+
+
+def cmd_flash(uf2: str) -> int:
+    if not os.path.isfile(uf2):
+        die(f"uf2 not found: {uf2}")
+    if not have_picotool():
+        die("picotool not found on PATH")
+    r = subprocess.run(["picotool", "load", "-f", uf2])
+    if r.returncode != 0:
+        print("pico: flash failed. If the device is running a non-cooperative app, "
+              "put it in BOOTSEL mode (hold BOOTSEL, tap reset) and re-run.",
+              file=sys.stderr)
+        return 2
+    print("pico: flashed; device rebooted to application mode.")
+    return 0
+
+
+def cmd_reboot(target: str) -> int:
+    if target not in ("app", "bootsel"):
+        die("reboot target must be 'app' or 'bootsel'", code=1)
+    flag = "-a" if target == "app" else "-f"
+    r = subprocess.run(["picotool", "reboot", flag])
+    if r.returncode != 0:
+        print(f"pico: reboot {target} failed (running app may not service the "
+              "reboot request). Use BOOTSEL + `pico flash` instead.", file=sys.stderr)
+        return 2
+    return 0
+
+
+def cmd_serial(idle_timeout: float | None, total_timeout: float | None) -> int:
+    dev = find_tty()
+    if not dev:
+        die("no CDC serial device found (is the Pico in BOOTSEL or not running?)")
+    print(f"pico: reading {dev} (Ctrl-C to stop)...", file=sys.stderr)
+    read_serial(dev, idle_timeout, total_timeout, log_command="serial")
+    return 0
+
+
+def cmd_run(uf2: str, capture_timeout: float) -> int:
+    """Flash + capture serial from boot.
+
+    Spawns a reader thread that waits for the CDC device to vanish
+    (entering BOOTSEL during `picotool load`), reappear (app boot), then
+    captures output. `picotool load -f` runs concurrently in the main
+    thread. Captured output is printed after the reader finishes.
+    """
+    if not os.path.isfile(uf2):
+        die(f"uf2 not found: {uf2}")
+    if not have_picotool():
+        die("picotool not found on PATH")
+
+    captured: dict[str, str] = {}
+    reader_done = threading.Event()
+
+    def reader() -> None:
+        # 1. wait for the CDC device to vanish (load reboots to BOOTSEL)
+        for _ in range(60):  # up to ~18s
+            if not glob.glob(TTY_GLOB):
+                break
+            time.sleep(0.3)
+        # 2. wait for it to reappear (app boots, CDC enumerates)
+        dev = None
+        fd = None
+        for _ in range(120):  # up to ~24s
+            devs = glob.glob(TTY_GLOB)
+            if devs:
+                try:
+                    fd = os.open(devs[0], os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+                    dev = devs[0]
+                    break
+                except OSError:
+                    pass
+            time.sleep(0.2)
+        if fd is None:
+            captured["err"] = "NO_DEVICE"
+            reader_done.set()
+            return
+        # 3. configure + read for `capture_timeout` seconds
+        try:
+            attrs = termios.tcgetattr(fd)
+            attrs[4] = BAUD; attrs[5] = BAUD
+            attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+            attrs[0] = 0; attrs[1] = 0; attrs[3] = 0
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            termios.tcflush(fd, termios.TCIOFLUSH)
+            buf = bytearray()
+            end = time.monotonic() + capture_timeout
+            while time.monotonic() < end:
+                r, _, _ = select.select([fd], [], [], 0.2)
+                if r:
+                    try:
+                        data = os.read(fd, 4096)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    buf += data
+            captured["buf"] = buf.decode(errors="replace")
+        except OSError as e:
+            captured["err"] = f"read error: {e}"
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        reader_done.set()
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
+    # Run picotool load concurrently (blocks until loaded + reboot-to-app).
+    load = subprocess.run(["picotool", "load", "-f", uf2])
+    if load.returncode != 0:
+        print("pico: flash failed. Put the device in BOOTSEL mode (hold BOOTSEL, "
+              "tap reset) and re-run `pico run`.", file=sys.stderr)
+        reader_done.wait(timeout=2.0)
+        return 2
+
+    # Wait for the reader to finish capturing.
+    reader_done.wait(timeout=capture_timeout + 30.0)
+    if "err" in captured:
+        die(captured["err"])
+    buf = captured.get("buf", "")
+    sys.stdout.write(buf)
+    sys.stdout.flush()
+    logpath = save_log("run", buf)
+    if logpath:
+        print(f"pico: saved log to {logpath}", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# arg parsing
+# ---------------------------------------------------------------------------
+
+def parse_timeout(args, flag, default):
+    if flag in args:
+        i = args.index(flag)
+        try:
+            val = float(args[i + 1])
+        except (IndexError, ValueError):
+            die(f"{flag} requires a number of seconds", code=1)
+        del args[i:i + 2]
+        return val, args
+    return default, args
+
+
+USAGE = """\
+usage: pico <command> [options]
+  info [--force]            (non-disruptive; --force reboots to query a running app)
+  flash <uf2>
+  reboot [app|bootsel]
+  serial [-t SEC] [-T SEC]  (live read; -t idle timeout, -T total timeout)
+  run <uf2> [-t SEC]        (flash + capture from boot; -t capture window, default 15s)
+"""
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        print(USAGE)
+        return 1
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "info":
+        return cmd_info(force="--force" in rest or "-f" in rest)
+    if cmd == "flash":
+        if not rest:
+            die("flash requires a <uf2> path", code=1)
+        return cmd_flash(rest[0])
+    if cmd == "reboot":
+        return cmd_reboot(rest[0] if rest else "app")
+    if cmd == "serial":
+        idle, rest = parse_timeout(rest, "-t", None)
+        total, rest = parse_timeout(rest, "-T", None)
+        return cmd_serial(idle, total)
+    if cmd == "run":
+        if not rest:
+            die("run requires a <uf2> path", code=1)
+        uf2 = rest[0]
+        rest = rest[1:]
+        total, rest = parse_timeout(rest, "-t", 15.0)
+        return cmd_run(uf2, total)
+    if cmd in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    die(f"unknown command '{cmd}'\n\n{USAGE}", code=1)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

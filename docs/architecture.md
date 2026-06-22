@@ -10,6 +10,10 @@ This document describes the architecture of cgx-reactor, a header-only C++20 cor
 4. **Compile-time task registration** — tasks are registered via NTTPs (non-type template parameters) or via `register_instance`/`register_task` helpers, eliminating runtime overhead
 5. **Cooperative scheduling** — tasks voluntarily yield via suspension points
 
+## Conventions
+
+**Abstract / concrete naming.** The library follows the STL `basic_string` / `string` pattern: an abstract interface is named with a simple noun (`engine`); its concrete templated implementation is `basic_<name>` (`basic_engine<Config, Clock, Logger, Entries...>`). User code normally holds `auto` from `make_engine`, which yields the concrete type. Pass the value to APIs that should not depend on template parameters via the abstract base (e.g. `void pipeline(engine& eng, task_uid a, task_uid b)`).
+
 ## Core Components
 
 ### Engine
@@ -19,12 +23,15 @@ The `engine` class is the central scheduler. It:
 - Maintains a timer queue for delayed suspensions
 - Provides `trigger()` to start tasks and `tick()` to advance time
 
-**Template parameters:**
+The concrete type returned by `make_engine` is `basic_engine<Config, Clock, Logger, Entries...>`, which publicly inherits the abstract `engine` interface. The non-trigger surface (`tick` / `run` / `report` / `dump` / `pool_exhausted` / `task_is_done` / `register_completion_waiter`) is virtual on `engine` so references can be passed around without template parameters. The templated and instance-based `trigger` overloads remain on the concrete class (they need the full task descriptor pack to dispatch).
+
+**Template parameters (concrete `basic_engine`):**
 ```cpp
 template <typename Config,          // Configuration policy
           typename Clock,           // clock concept (std::chrono-compatible)
+          typename Logger,          // logger policy (default: no_logger)
           typename... Entries>      // Typed slot entries (descriptors)
-class engine;
+class basic_engine;
 ```
 
 **Construction (via `make_engine`):**
@@ -41,6 +48,42 @@ auto eng = make_engine<Config, Clock>(
     register_instance<"DISP"_tag>(display)
 );
 ```
+
+**Passing an engine by abstract reference:**
+```cpp
+void pipeline(cgx::reactor::engine& eng, cgx::reactor::task_uid a,
+              cgx::reactor::task_uid b) {
+    eng.trigger(a);  // UID-based, non-blocking
+    eng.trigger(b);
+}
+// ...
+pipeline(eng, task_uid_v<&do_a>, task_uid_v<&do_b>);
+```
+
+### Engine Interface
+
+The abstract `engine` base exposes:
+
+| Member | Description |
+|---|---|
+| `void run()` | Concrete run loop: `tick()` + 1ms sleep, forever. |
+| `virtual void tick() = 0` | Advance by one tick (resume ready tasks, fire expired timers). |
+| `virtual engine_report report() const = 0` | Static stats (task count, pool sizes). |
+| `virtual engine_report dump() const = 0` | Dump via `Logger::print()`. |
+| `virtual engine_report dump_erased(void(*)(void*, string_view), void*) = 0` | Type-erased sink dump. |
+| `template<Sink> dump(Sink&&)` | Non-virtual wrapper: type-erases a captureless `Sink` and calls `dump_erased`. |
+| `virtual bool pool_exhausted() = 0` | True iff any reserved task's probed frame overflowed. |
+| `virtual task_handle trigger(task_uid) = 0` | **UID-based trigger** (non-blocking, runtime dispatch via hashmap). |
+| `template<Class> trigger(Class&, task_uid)` | Type-safe wrapper for instance-pinned UID trigger. |
+
+`task_uid` is a strongly-typed 32-bit UID (FNV-1a hash of the function's pretty name). The variable template `task_uid_v<auto Fn>` is a compile-time constant computable **without the engine type** — the same UID at the registration site and at every call site, for the same function. Distinct UIDs for distinct functions are enforced by a compile-time `static_assert` on `basic_engine` (the assertion allows equal UIDs only for the same function, i.e. multi-instance registration).
+
+**Two trigger surfaces coexist on `basic_engine`:**
+
+- **Compile-time / templated** — `eng.trigger<auto Fn>(args...)` and `eng.trigger(obj, &Class::method, args...)`. The slot index is computed at compile time. For scratchpad tasks, the templated form returns a blocking awaiter that suspends the caller if the pool is full. Full arg forwarding.
+- **Runtime / UID-based (interface)** — `eng.trigger(task_uid_v<&fn>)` and `eng.trigger(obj, task_uid_v<&fn>)`. Non-blocking, returns a `task_handle` with `error()`. Runtime dispatch via a fixed-size open-addressing hashmap (zero-heap, linear probing, load factor ≤ 50%). `task_uid`-only trigger hits the **first registered instance**; `task_uid` + object disambiguates a specific instance. Arg-free (type erasure can't forward typed args).
+
+Both surfaces return the same non-templated `task_handle`; `co_await h.done()` works identically.
 
 ### Task
 
@@ -311,6 +354,15 @@ All memory is statically allocated:
 8. **Scratchpad waiters** — fixed-size array for blocked scratchpad triggers (bounded by 8)
 
 **No dynamic allocation occurs at runtime.**
+
+### Compile-time vs runtime trade-offs
+
+The engine's compile-time task registration (NTTPs, per-entry descriptors) creates a tension across compile time, runtime dispatch cost, and flash footprint — the per-entry template instantiation count scales with the task count. Two dispatch surfaces reflect this:
+
+- The compile-time templated `trigger<&fn>()` resolves the slot at compile time (fast runtime) but instantiates per entry.
+- The runtime UID `trigger(task_uid)` resolves the slot via a hashmap + a per-slot function-pointer table (the irreducible per-task call trampoline) — one heavy method shared across slots, keeping flash code small.
+
+Coroutine frame sizes are **not** constexpr in C++20 (coroutines cannot be created in a constexpr context), so pool fitting is runtime-probed, never a compile-time check. `sizeof(basic_engine<Config, Clock, Logger, Entries...>)` is a compile-time constant equal to the engine's full SRAM footprint (all per-engine arrays are class members) — use it in `static_assert` or a print to predict the SRAM ceiling before flashing.
 
 ### Reserved vs Scratchpad Tasks
 
